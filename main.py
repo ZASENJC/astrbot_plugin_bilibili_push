@@ -1,0 +1,1184 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import At, Image, Json, Video as MessageVideo
+from astrbot.api.star import Context, Star, StarTools
+from bilibili_api import Credential, request_settings, select_client
+from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
+from bilibili_api.user import User, VideoOrder, get_self_info
+from bilibili_api.video import (
+    AudioStreamDownloadURL,
+    Video,
+    VideoCodecs,
+    VideoDownloadURLDataDetecter,
+    VideoQuality,
+    VideoStreamDownloadURL,
+)
+
+PLUGIN_NAME = "astrbot_plugin_bilibili_push"
+DEFAULT_CHECK_INTERVAL_MINUTES = 10
+DEFAULT_REQUEST_INTERVAL_SECONDS = 2
+DEFAULT_TIMEOUT_SECONDS = 20
+DEFAULT_DEBOUNCE_SECONDS = 300
+DEFAULT_FETCH_LIMIT = 5
+DEFAULT_DESC_LENGTH = 120
+STARTUP_DELAY_SECONDS = 10
+QR_POLL_SECONDS = 2
+QR_MAX_POLLS = 45
+
+DEFAULT_PARSE_TEMPLATE = (
+    "📺 {title}\n"
+    "UP: {up_name}\n"
+    "时长: {duration}\n"
+    "发布时间: {pub_time}\n"
+    "播放: {view}  点赞: {like}  弹幕: {danmaku}\n"
+    "简介: {desc}\n"
+    "链接: {link}"
+)
+DEFAULT_PUSH_TEMPLATE = (
+    "🔔 {up_name} 投稿了新视频\n\n"
+    "{title}\n"
+    "时长: {duration}\n"
+    "发布时间: {pub_time}\n"
+    "播放: {view}  点赞: {like}\n"
+    "简介: {desc}\n"
+    "链接: {link}"
+)
+
+URL_PATTERN = re.compile(
+    r'(?P<url>(?:https?://)?(?:www\.)?(?:b23\.tv|bili2233\.cn|(?:m\.)?bilibili\.com|space\.bilibili\.com)[^\s<>"\']+)',
+    re.IGNORECASE,
+)
+BV_PATTERN = re.compile(r"\b(?P<bvid>BV[0-9A-Za-z]{10})\b")
+AV_PATTERN = re.compile(r"\b(?P<avid>av\d{6,})\b", re.IGNORECASE)
+VIDEO_BV_URL_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?bilibili\.com/video/(?P<bvid>BV[0-9A-Za-z]{10})", re.IGNORECASE)
+VIDEO_AV_URL_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?bilibili\.com/video/(?P<avid>av\d{6,})", re.IGNORECASE)
+SHORT_URL_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?(?:b23\.tv|bili2233\.cn)/", re.IGNORECASE)
+SPACE_UID_PATTERN = re.compile(r"(?:https?://)?space\.bilibili\.com/(?P<uid>\d+)", re.IGNORECASE)
+SPACE_UID_QUERY_PATTERN = re.compile(r"(?:uid|mid|vmid)=(?P<uid>\d+)", re.IGNORECASE)
+BILIBILI_SCHEME_AV_PATTERN = re.compile(r"bilibili://video/av(?P<avid>\d+)", re.IGNORECASE)
+TRAILING_PUNCTUATION = "'\"）)]】}>，。！？；：,.!?;:"
+
+
+try:
+    select_client("curl_cffi")
+    request_settings.set("impersonate", "chrome131")
+except Exception as err:
+    logger.warning(f"BilibiliPush: 初始化 bilibili-api 客户端失败，将使用默认客户端: {err}")
+
+
+@dataclass(frozen=True)
+class MonitorRule:
+    uid: int
+    targets: Tuple[str, ...]
+    source: str
+
+
+@dataclass
+class FeedVideoItem:
+    aid: int
+    bvid: str
+    title: str
+    created_ts: int
+    author: str
+    cover_url: str = ""
+    desc: str = ""
+
+
+@dataclass
+class VideoCard:
+    aid: int
+    bvid: str
+    title: str
+    link: str
+    up_name: str
+    cover_url: str
+    desc: str
+    duration_seconds: int
+    pub_ts: int
+    view: int
+    like: int
+    danmaku: int
+    reply: int
+    favorite: int
+    coin: int
+    share: int
+    tname: str = ""
+    part_title: str = ""
+    direct_video_url: Optional[str] = None
+
+    @property
+    def duration_text(self) -> str:
+        return format_duration(self.duration_seconds)
+
+
+@dataclass
+class ParseTarget:
+    bvid: Optional[str] = None
+    aid: Optional[int] = None
+    page_num: int = 1
+    raw_input: str = ""
+
+
+class SafeFormatDict(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+class DebounceCache:
+    def __init__(self, ttl_seconds: int) -> None:
+        self.ttl_seconds = max(0, ttl_seconds)
+        self._link_cache: Dict[Tuple[str, str], float] = {}
+        self._resource_cache: Dict[Tuple[str, str], float] = {}
+
+    def update_ttl(self, ttl_seconds: int) -> None:
+        self.ttl_seconds = max(0, ttl_seconds)
+
+    def hit_link(self, session: str, key: str) -> bool:
+        return self._hit(self._link_cache, session, key)
+
+    def hit_resource(self, session: str, key: str) -> bool:
+        return self._hit(self._resource_cache, session, key)
+
+    def _hit(self, cache: Dict[Tuple[str, str], float], session: str, key: str) -> bool:
+        if self.ttl_seconds <= 0:
+            return False
+        self._cleanup(cache)
+        now = time.time()
+        composite = (session, key)
+        expires_at = cache.get(composite, 0)
+        if expires_at > now:
+            return True
+        cache[composite] = now + self.ttl_seconds
+        return False
+
+    def _cleanup(self, cache: Dict[Tuple[str, str], float]) -> None:
+        if not cache:
+            return
+        now = time.time()
+        expired = [key for key, deadline in cache.items() if deadline <= now]
+        for key in expired:
+            cache.pop(key, None)
+
+
+class BilibiliCredentialManager:
+    def __init__(self, data_dir: Path, auth_config_getter) -> None:
+        self.data_dir = data_dir
+        self.credential_file = data_dir / "bilibili_credential.json"
+        self.auth_config_getter = auth_config_getter
+        self._credential: Optional[Credential] = None
+        self._qr_login: Optional[QrCodeLogin] = None
+        self._lock = asyncio.Lock()
+        self._last_manual_cookie: Optional[str] = None
+
+    def _manual_cookie(self) -> str:
+        config = self.auth_config_getter() or {}
+        return str(config.get("bilibili_cookie", "") or "").strip()
+
+    def _save_credential(self) -> None:
+        if self._credential is None:
+            return
+        self.credential_file.write_text(
+            json.dumps(self._credential.get_cookies(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_credential(self) -> None:
+        if not self.credential_file.exists():
+            return
+        try:
+            raw = json.loads(self.credential_file.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._credential = Credential.from_cookies(raw)
+        except Exception as err:
+            logger.error(f"BilibiliPush: 读取凭证文件失败: {err}")
+
+    def _cookies_to_dict(self, cookies_str: str) -> Dict[str, str]:
+        cookies: Dict[str, str] = {}
+        for item in cookies_str.split(";"):
+            part = item.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            cookies[name.strip()] = value.strip()
+        return cookies
+
+    async def get_credential(self) -> Optional[Credential]:
+        async with self._lock:
+            manual_cookie = self._manual_cookie()
+            if manual_cookie and manual_cookie != self._last_manual_cookie:
+                self._last_manual_cookie = manual_cookie
+                try:
+                    manual_credential = Credential.from_cookies(
+                        self._cookies_to_dict(manual_cookie)
+                    )
+                    if await manual_credential.check_valid():
+                        self._credential = manual_credential
+                        self._save_credential()
+                        logger.info(
+                            f"BilibiliPush: 已将配置中的 Cookie 持久化到 {self.credential_file}"
+                        )
+                    else:
+                        logger.warning("BilibiliPush: 配置中的 Bilibili Cookie 无效，将尝试使用本地持久化凭证")
+                except Exception as err:
+                    logger.error(f"BilibiliPush: 校验配置中的 Cookie 失败: {err}")
+
+            if self._credential is None:
+                self._load_credential()
+
+            if self._credential is None:
+                return None
+
+            try:
+                if not await self._credential.check_valid():
+                    logger.warning("BilibiliPush: 当前 Bilibili 凭证无效，请重新登录")
+                    return None
+                if await self._credential.check_refresh():
+                    if self._credential.has_ac_time_value() and self._credential.has_bili_jct():
+                        await self._credential.refresh()
+                        self._save_credential()
+                        logger.info("BilibiliPush: 已自动刷新并持久化 Bilibili 凭证")
+                    else:
+                        logger.warning(
+                            "BilibiliPush: 凭证需要刷新，但缺少 bili_jct 或 ac_time_value，无法自动刷新"
+                        )
+            except Exception as err:
+                logger.error(f"BilibiliPush: 检查或刷新凭证失败: {err}")
+                return None
+
+            return self._credential
+
+    async def login_with_qrcode(self) -> bytes:
+        self._qr_login = QrCodeLogin()
+        await self._qr_login.generate_qrcode()
+        return self._qr_login.get_qrcode_picture().content
+
+    async def check_qr_state(self) -> AsyncGenerator[str, None]:
+        if self._qr_login is None:
+            yield "二维码尚未生成，请先执行登录指令。"
+            return
+
+        scan_tip_pending = True
+        for _ in range(QR_MAX_POLLS):
+            try:
+                state = await self._qr_login.check_state()
+            except Exception as err:
+                yield f"检查二维码状态失败: {err}"
+                return
+
+            if state == QrCodeLoginEvents.DONE:
+                self._credential = self._qr_login.get_credential()
+                self._save_credential()
+                try:
+                    profile = await get_self_info(self._credential)
+                    uname = str(profile.get("name") or "未知账号")
+                    uid = str(profile.get("mid") or "未知UID")
+                    yield f"登录成功，当前账号: {uname} (UID: {uid})"
+                except Exception:
+                    yield "登录成功，凭证已持久化保存。"
+                return
+            if state == QrCodeLoginEvents.CONF:
+                if scan_tip_pending:
+                    yield "二维码已扫描，请在哔哩哔哩客户端确认登录。"
+                    scan_tip_pending = False
+            elif state == QrCodeLoginEvents.SCAN:
+                pass
+            elif state == QrCodeLoginEvents.TIMEOUT:
+                yield "二维码已过期，请重新执行登录指令。"
+                return
+            await asyncio.sleep(QR_POLL_SECONDS)
+
+        yield "二维码登录超时，请重新执行登录指令。"
+
+    async def verify(self) -> Tuple[bool, str]:
+        credential = await self.get_credential()
+        if credential is None:
+            return False, "当前没有可用的 Bilibili 登录态。"
+        try:
+            profile = await get_self_info(credential)
+            uname = str(profile.get("name") or "未知账号")
+            uid = str(profile.get("mid") or "未知UID")
+            return True, f"Cookie 有效，当前账号: {uname} (UID: {uid})"
+        except Exception as err:
+            logger.error(f"BilibiliPush: 校验登录态失败: {err}")
+            return False, f"登录态校验失败: {err}"
+
+    async def clear(self) -> None:
+        async with self._lock:
+            self._credential = None
+            self._qr_login = None
+            self._last_manual_cookie = None
+            try:
+                self.credential_file.unlink(missing_ok=True)
+            except Exception as err:
+                logger.error(f"BilibiliPush: 删除本地凭证失败: {err}")
+
+
+class BilibiliService:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        credential_manager: BilibiliCredentialManager,
+        content_config_getter,
+    ) -> None:
+        self.client = client
+        self.credential_manager = credential_manager
+        self.content_config_getter = content_config_getter
+
+    async def resolve_short_url(self, url: str) -> str:
+        normalized = ensure_scheme(strip_trailing_punctuation(url))
+        response = await self.client.get(normalized, follow_redirects=True)
+        return str(response.url)
+
+    def resolve_uid(self, source: str) -> Optional[int]:
+        candidate = source.strip()
+        if not candidate:
+            return None
+        if candidate.isdigit():
+            return int(candidate)
+        if match := SPACE_UID_PATTERN.search(candidate):
+            return int(match.group("uid"))
+        if match := SPACE_UID_QUERY_PATTERN.search(candidate):
+            return int(match.group("uid"))
+        return None
+
+    async def fetch_recent_videos(self, uid: int, limit: int) -> List[FeedVideoItem]:
+        credential = await self.credential_manager.get_credential()
+        user = User(uid, credential=credential)
+        payload = await user.get_videos(ps=max(1, min(limit, 30)), order=VideoOrder.PUBDATE)
+        section = payload.get("list") if isinstance(payload, dict) else None
+        raw_items = []
+        if isinstance(section, dict):
+            raw_items = section.get("vlist") or []
+        elif isinstance(payload, dict):
+            raw_items = payload.get("vlist") or []
+
+        items: List[FeedVideoItem] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            bvid = str(raw.get("bvid") or "")
+            aid = safe_int(raw.get("aid"), 0)
+            if not bvid or aid <= 0:
+                continue
+            items.append(
+                FeedVideoItem(
+                    aid=aid,
+                    bvid=bvid,
+                    title=str(raw.get("title") or "未命名视频"),
+                    created_ts=safe_int(raw.get("created"), 0),
+                    author=str(raw.get("author") or "未知UP"),
+                    cover_url=normalize_cover_url(raw.get("pic") or ""),
+                    desc=str(raw.get("description") or ""),
+                )
+            )
+        return items
+
+    async def fetch_video_card(self, target: ParseTarget) -> VideoCard:
+        credential = await self.credential_manager.get_credential()
+        if target.aid:
+            video = Video(aid=target.aid, credential=credential)
+        elif target.bvid:
+            video = Video(bvid=target.bvid, credential=credential)
+        else:
+            raise ValueError("缺少视频标识")
+
+        info = await video.get_info()
+        pages = info.get("pages") or []
+        page_index = max(0, target.page_num - 1)
+        if page_index >= len(pages):
+            page_index = 0
+        page_info = pages[page_index] if pages else {}
+
+        title = str(info.get("title") or "未命名视频")
+        part_title = str(page_info.get("part") or "")
+        if len(pages) > 1 and part_title and part_title != title:
+            title = f"{title} [P{page_index + 1} {part_title}]"
+
+        direct_video_url = None
+        if bool(self.content_config_getter().get("send_direct_video", False)):
+            direct_video_url = await self._extract_direct_video_url(video, page_index)
+
+        stat = info.get("stat") or {}
+        owner = info.get("owner") or {}
+        pub_ts = safe_int(info.get("pubdate") or info.get("ctime"), 0)
+        bvid = str(info.get("bvid") or target.bvid or "")
+        aid = safe_int(info.get("aid") or target.aid, 0)
+        link = f"https://www.bilibili.com/video/{bvid}"
+        if page_index > 0:
+            link += f"?p={page_index + 1}"
+
+        return VideoCard(
+            aid=aid,
+            bvid=bvid,
+            title=title,
+            link=link,
+            up_name=str(owner.get("name") or "未知UP"),
+            cover_url=normalize_cover_url(info.get("pic") or ""),
+            desc=str(info.get("desc") or ""),
+            duration_seconds=safe_int(page_info.get("duration") or info.get("duration"), 0),
+            pub_ts=pub_ts,
+            view=safe_int(stat.get("view"), 0),
+            like=safe_int(stat.get("like"), 0),
+            danmaku=safe_int(stat.get("danmaku"), 0),
+            reply=safe_int(stat.get("reply"), 0),
+            favorite=safe_int(stat.get("favorite"), 0),
+            coin=safe_int(stat.get("coin"), 0),
+            share=safe_int(stat.get("share"), 0),
+            tname=str(info.get("tname") or ""),
+            part_title=part_title,
+            direct_video_url=direct_video_url,
+        )
+
+    async def _extract_direct_video_url(self, video: Video, page_index: int) -> Optional[str]:
+        try:
+            config = self.content_config_getter() or {}
+            quality_name = str(config.get("video_quality", "_720P")).upper()
+            codec_name = str(config.get("video_codecs", "AVC")).upper()
+            quality = getattr(VideoQuality, quality_name, VideoQuality._720P)
+            codecs = getattr(VideoCodecs, codec_name, VideoCodecs.AVC)
+            download_url_data = await video.get_download_url(page_index=page_index)
+            detecter = VideoDownloadURLDataDetecter(download_url_data)
+            streams = detecter.detect_best_streams(
+                video_max_quality=quality,
+                codecs=[codecs],
+                no_dolby_video=True,
+                no_hdr=True,
+            )
+            if not streams:
+                return None
+            video_stream = streams[0]
+            if not isinstance(video_stream, VideoStreamDownloadURL):
+                return None
+            audio_stream = streams[1] if len(streams) > 1 else None
+            if isinstance(audio_stream, AudioStreamDownloadURL):
+                return None
+            return video_stream.url
+        except Exception as err:
+            logger.warning(f"BilibiliPush: 提取直链视频失败，将回退为图文卡片: {err}")
+            return None
+
+
+class LinkResolver:
+    def __init__(self, service: BilibiliService) -> None:
+        self.service = service
+
+    async def extract_parse_target(
+        self,
+        messages: Sequence[Any],
+        text: str,
+    ) -> Optional[ParseTarget]:
+        candidate = self._extract_candidate(messages, text)
+        if not candidate:
+            return None
+        return await self._normalize_candidate(candidate)
+
+    def _extract_candidate(self, messages: Sequence[Any], text: str) -> Optional[str]:
+        direct = self._extract_from_text(text)
+        if direct:
+            return direct
+
+        for component in messages:
+            if isinstance(component, Json):
+                card_url = extract_json_url(component.data)
+                if card_url:
+                    return card_url
+                candidate = self._extract_from_json(component.data)
+                if candidate:
+                    return candidate
+        return None
+
+    def _extract_from_text(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        stripped = text.strip()
+        if stripped.startswith("/"):
+            return None
+        if match := URL_PATTERN.search(stripped):
+            return strip_trailing_punctuation(match.group("url"))
+        if match := BV_PATTERN.search(stripped):
+            return match.group("bvid")
+        if match := AV_PATTERN.search(stripped):
+            return match.group("avid")
+        return None
+
+    def _extract_from_json(self, payload: Any) -> Optional[str]:
+        for value in iter_string_values(payload):
+            if candidate := self._extract_from_text(value):
+                return candidate
+        return None
+
+    async def _normalize_candidate(self, candidate: str) -> Optional[ParseTarget]:
+        cleaned = strip_trailing_punctuation(candidate)
+        if SHORT_URL_PATTERN.search(cleaned):
+            try:
+                cleaned = await self.service.resolve_short_url(cleaned)
+            except Exception as err:
+                logger.error(f"BilibiliPush: 解析短链失败 {candidate}: {err}")
+                return None
+
+        if match := BV_PATTERN.search(cleaned):
+            page_num = extract_page_num(cleaned)
+            return ParseTarget(bvid=match.group("bvid"), page_num=page_num, raw_input=candidate)
+
+        if match := VIDEO_BV_URL_PATTERN.search(cleaned):
+            page_num = extract_page_num(cleaned)
+            return ParseTarget(bvid=match.group("bvid"), page_num=page_num, raw_input=candidate)
+
+        if match := BILIBILI_SCHEME_AV_PATTERN.search(cleaned):
+            return ParseTarget(aid=safe_int(match.group("avid"), 0), raw_input=candidate)
+
+        if match := VIDEO_AV_URL_PATTERN.search(cleaned):
+            return ParseTarget(aid=safe_int(match.group("avid").lstrip("avAV"), 0), page_num=extract_page_num(cleaned), raw_input=candidate)
+
+        if match := AV_PATTERN.search(cleaned):
+            return ParseTarget(aid=safe_int(match.group("avid").lstrip("avAV"), 0), raw_input=candidate)
+
+        return None
+
+
+class Main(Star):
+    """B 站视频自动解析与订阅推送插件。"""
+
+    def __init__(self, context: Context, config: Optional[dict] = None):
+        super().__init__(context, config)
+        self.config = config or {}
+        self.running = False
+        self.monitor_task: Optional[asyncio.Task] = None
+        self.session_initialized_uids: set[int] = set()
+
+        self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.state_file = self.data_dir / "monitor_state.json"
+        self._state = self._load_state()
+
+        transport = httpx.AsyncHTTPTransport(retries=2)
+        limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        self.client = httpx.AsyncClient(
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+            transport=transport,
+            limits=limits,
+            follow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                )
+            },
+        )
+
+        self.credential_manager = BilibiliCredentialManager(
+            data_dir=self.data_dir,
+            auth_config_getter=lambda: self.auth_config,
+        )
+        self.service = BilibiliService(
+            client=self.client,
+            credential_manager=self.credential_manager,
+            content_config_getter=lambda: self.content_config,
+        )
+        self.link_resolver = LinkResolver(self.service)
+        self.debouncer = DebounceCache(self.debounce_seconds)
+
+    @property
+    def auth_config(self) -> Dict[str, Any]:
+        return self.config.get("auth_settings", {}) or {}
+
+    @property
+    def monitoring_config(self) -> Dict[str, Any]:
+        return self.config.get("monitoring_settings", {}) or {}
+
+    @property
+    def content_config(self) -> Dict[str, Any]:
+        return self.config.get("content_settings", {}) or {}
+
+    @property
+    def runtime_config(self) -> Dict[str, Any]:
+        return self.config.get("runtime_settings", {}) or {}
+
+    @property
+    def debounce_seconds(self) -> int:
+        return safe_int(
+            self.runtime_config.get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS),
+            DEFAULT_DEBOUNCE_SECONDS,
+            minimum=0,
+            maximum=24 * 60 * 60,
+        )
+
+    @property
+    def parse_template(self) -> str:
+        template = self.content_config.get("parse_message_format", DEFAULT_PARSE_TEMPLATE)
+        return str(template or DEFAULT_PARSE_TEMPLATE).replace("\\n", "\n")
+
+    @property
+    def push_template(self) -> str:
+        template = self.content_config.get("push_message_format", DEFAULT_PUSH_TEMPLATE)
+        return str(template or DEFAULT_PUSH_TEMPLATE).replace("\\n", "\n")
+
+    async def initialize(self):
+        self.running = True
+        self.debouncer.update_ttl(self.debounce_seconds)
+        self.monitor_task = asyncio.create_task(self.run_monitor())
+
+    async def terminate(self):
+        self.running = False
+        if self.monitor_task:
+            self.monitor_task.cancel()
+            try:
+                await self.monitor_task
+            except asyncio.CancelledError:
+                pass
+        await self.client.aclose()
+        logger.info("BilibiliPush: 插件已停止")
+
+    def _load_state(self) -> Dict[str, Any]:
+        if not self.state_file.exists():
+            return {}
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception as err:
+            logger.error(f"BilibiliPush: 加载状态文件失败: {err}")
+            return {}
+
+    def _save_state(self) -> None:
+        temp_file = self.state_file.with_suffix(".tmp")
+        try:
+            temp_file.write_text(
+                json.dumps(self._state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_file.replace(self.state_file)
+        except Exception as err:
+            logger.error(f"BilibiliPush: 保存状态文件失败: {err}")
+            try:
+                temp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _state_get(self, key: str, default: Any = None) -> Any:
+        return self._state.get(key, default)
+
+    def _state_set(self, key: str, value: Any) -> None:
+        self._state[key] = value
+        self._save_state()
+
+    def _state_update(self, values: Dict[str, Any]) -> None:
+        self._state.update(values)
+        self._save_state()
+
+    def _parse_multi_value(self, raw: Any) -> List[str]:
+        if isinstance(raw, str):
+            candidates = [raw]
+        elif isinstance(raw, list):
+            candidates = [str(item) for item in raw]
+        else:
+            return []
+
+        values: List[str] = []
+        for item in candidates:
+            for part in item.replace("\n", ",").split(","):
+                value = part.strip()
+                if value:
+                    values.append(value)
+        return list(dict.fromkeys(values))
+
+    def _pick_interval(self, base: int, jitter: int, minimum: int = 1) -> int:
+        if jitter <= 0:
+            return max(minimum, base)
+        return max(minimum, random.randint(base - jitter, base + jitter))
+
+    def _get_bot_owner_id(self) -> str:
+        try:
+            cfg = self.context.get_config()
+            admins = cfg.get("admins_id", [])
+        except Exception:
+            admins = []
+        if isinstance(admins, list) and admins:
+            return str(admins[0])
+        return ""
+
+    def _is_bot_owner(self, event: AstrMessageEvent) -> bool:
+        owner_id = self._get_bot_owner_id()
+        if not owner_id:
+            return True
+        return str(event.get_sender_id()) == owner_id
+
+    def _resolve_monitor_rules(self) -> List[MonitorRule]:
+        raw_rules = self.monitoring_config.get("subscription_rules", []) or []
+        merged_targets: Dict[int, List[str]] = {}
+        source_map: Dict[int, str] = {}
+
+        for item in raw_rules:
+            if not isinstance(item, dict):
+                continue
+            targets = self._parse_multi_value(item.get("allowed_targets", ""))
+            if not targets:
+                continue
+            for source in self._parse_multi_value(item.get("source", "")):
+                uid = self.service.resolve_uid(source)
+                if uid is None:
+                    logger.warning(f"BilibiliPush: 无法解析监控来源 {source!r}，已跳过")
+                    continue
+                merged_targets.setdefault(uid, [])
+                for target in targets:
+                    if target not in merged_targets[uid]:
+                        merged_targets[uid].append(target)
+                source_map.setdefault(uid, source)
+
+        return [
+            MonitorRule(uid=uid, targets=tuple(targets), source=source_map.get(uid, str(uid)))
+            for uid, targets in merged_targets.items()
+        ]
+
+    def _render_video_text(self, card: VideoCard, *, push: bool) -> str:
+        desc_limit = safe_int(
+            self.content_config.get("description_length", DEFAULT_DESC_LENGTH),
+            DEFAULT_DESC_LENGTH,
+            minimum=0,
+            maximum=2000,
+        )
+        desc = sanitize_desc(card.desc, desc_limit)
+        payload = SafeFormatDict(
+            title=card.title,
+            up_name=card.up_name,
+            link=card.link,
+            bvid=card.bvid,
+            aid=card.aid,
+            duration=card.duration_text,
+            pub_time=format_timestamp(card.pub_ts),
+            view=format_count(card.view),
+            like=format_count(card.like),
+            danmaku=format_count(card.danmaku),
+            reply=format_count(card.reply),
+            favorite=format_count(card.favorite),
+            coin=format_count(card.coin),
+            share=format_count(card.share),
+            tname=card.tname,
+            desc=desc,
+            part_title=card.part_title,
+        )
+        template = self.push_template if push else self.parse_template
+        return template.format_map(payload)
+
+    def _build_message_chain(self, card: VideoCard, *, push: bool) -> MessageChain:
+        chain = MessageChain().message(self._render_video_text(card, push=push))
+        if bool(self.content_config.get("send_cover", True)) and card.cover_url:
+            chain.url_image(card.cover_url)
+        if bool(self.content_config.get("send_direct_video", False)) and card.direct_video_url:
+            chain.chain.append(MessageVideo.fromURL(card.direct_video_url))
+        return chain
+
+    async def _send_card_to_targets(self, card: VideoCard, targets: Sequence[str]) -> Dict[str, int]:
+        success = 0
+        failure = 0
+        chain = self._build_message_chain(card, push=True)
+        for target in targets:
+            try:
+                sent = await self.context.send_message(target, chain)
+                if sent:
+                    success += 1
+                else:
+                    failure += 1
+            except Exception as err:
+                logger.error(f"BilibiliPush: 发送到 {target} 失败: {err}")
+                failure += 1
+        return {"target_success": success, "target_failure": failure}
+
+    async def _check_uid_videos(self, uid: int, *, force_fetch: bool = False) -> List[FeedVideoItem]:
+        fetch_limit = safe_int(
+            self.runtime_config.get("latest_fetch_limit", DEFAULT_FETCH_LIMIT),
+            DEFAULT_FETCH_LIMIT,
+            minimum=1,
+            maximum=20,
+        )
+        items = await self.service.fetch_recent_videos(uid, fetch_limit)
+        if not items:
+            return []
+        if force_fetch:
+            return items
+
+        state_key_aid = f"last_aid_{uid}"
+        state_key_bvid = f"last_bvid_{uid}"
+        last_aid = safe_int(self._state_get(state_key_aid, 0), 0)
+        last_bvid = str(self._state_get(state_key_bvid, "") or "")
+        latest = items[0]
+
+        if last_aid == 0 or uid not in self.session_initialized_uids:
+            self._state_update({state_key_aid: latest.aid, state_key_bvid: latest.bvid})
+            self.session_initialized_uids.add(uid)
+            logger.info(f"BilibiliPush: 初始化 UID={uid} 的监控基线为 {latest.bvid}")
+            return []
+
+        new_items: List[FeedVideoItem] = []
+        for item in items:
+            if item.aid == last_aid or (last_bvid and item.bvid == last_bvid):
+                break
+            new_items.append(item)
+
+        self.session_initialized_uids.add(uid)
+        self._state_update({state_key_aid: latest.aid, state_key_bvid: latest.bvid})
+        new_items.reverse()
+        return new_items
+
+    async def _push_recent_video_to_current_session(
+        self, event: AstrMessageEvent, source: str
+    ) -> Tuple[bool, str]:
+        uid = self.service.resolve_uid(source)
+        if uid is None:
+            return False, "无法从输入中解析出 UP 主 UID。"
+        recent = await self._check_uid_videos(uid, force_fetch=True)
+        if not recent:
+            return False, f"UID {uid} 最近没有获取到视频。"
+        card = await self.service.fetch_video_card(ParseTarget(bvid=recent[0].bvid))
+        yield_chain = self._build_message_chain(card, push=True)
+        await self.context.send_message(event.unified_msg_origin, yield_chain)
+        return True, f"已向当前会话发送 UID {uid} 的最新视频。"
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_message(self, event: AstrMessageEvent):
+        if not bool(self.content_config.get("auto_parse_enabled", True)):
+            return
+        if str(event.get_sender_id()) == str(event.get_self_id()):
+            return
+
+        messages = event.get_messages() or []
+        if messages:
+            first = messages[0]
+            if isinstance(first, At) and str(first.qq) != str(event.get_self_id()):
+                return
+
+        self.debouncer.update_ttl(self.debounce_seconds)
+
+        try:
+            target = await self.link_resolver.extract_parse_target(messages, event.message_str or "")
+            if target is None:
+                return
+
+            debounce_key = target.raw_input or target.bvid or str(target.aid)
+            if self.debouncer.hit_link(event.unified_msg_origin, debounce_key):
+                return
+
+            card = await self.service.fetch_video_card(target)
+            if self.debouncer.hit_resource(event.unified_msg_origin, card.bvid or str(card.aid)):
+                return
+
+            chain = self._build_message_chain(card, push=False)
+            yield event.chain_result(chain.chain)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            logger.error(f"BilibiliPush: 自动解析失败: {err}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_login", alias={"登录B站", "登录b站", "blogin"})
+    async def bili_login(self, event: AstrMessageEvent):
+        if not self._is_bot_owner(event):
+            yield event.plain_result("❌ 此指令仅机器人主人可用。")
+            return
+        qrcode = await self.credential_manager.login_with_qrcode()
+        yield event.chain_result([Image.fromBytes(qrcode)])
+        async for message in self.credential_manager.check_qr_state():
+            yield event.plain_result(message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_verify", alias={"bili_cookie_status", "检查B站登录态", "检查b站登录态"})
+    async def bili_verify(self, event: AstrMessageEvent):
+        ok, message = await self.credential_manager.verify()
+        prefix = "✅" if ok else "❌"
+        yield event.plain_result(f"{prefix} {message}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_logout", alias={"清除B站登录态", "清除b站登录态"})
+    async def bili_logout(self, event: AstrMessageEvent):
+        if not self._is_bot_owner(event):
+            yield event.plain_result("❌ 此指令仅机器人主人可用。")
+            return
+        await self.credential_manager.clear()
+        yield event.plain_result("✅ 已清除本地持久化的 Bilibili 登录态。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_check")
+    async def bili_check(self, event: AstrMessageEvent, source: str = ""):
+        if source:
+            try:
+                uid = self.service.resolve_uid(source)
+                if uid is None:
+                    yield event.plain_result("❌ 无法从输入中解析出 UID，请提供 UID 或空间链接。")
+                    return
+                recent = await self._check_uid_videos(uid, force_fetch=True)
+                if not recent:
+                    yield event.plain_result(f"ℹ️ UID {uid} 最近没有获取到视频。")
+                    return
+                card = await self.service.fetch_video_card(ParseTarget(bvid=recent[0].bvid))
+                chain = self._build_message_chain(card, push=True)
+                await self.context.send_message(event.unified_msg_origin, chain)
+                yield event.plain_result(f"✅ 已向当前会话发送 UID {uid} 的最新视频。")
+            except Exception as err:
+                logger.error(f"BilibiliPush: 手动检查失败: {err}")
+                yield event.plain_result(f"❌ 手动检查失败: {err}")
+            return
+
+        rules = self._resolve_monitor_rules()
+        if not rules:
+            yield event.plain_result("❌ 没有可用的监控规则，请先在插件配置中填写订阅规则。")
+            return
+
+        rule = rules[0]
+        recent = await self._check_uid_videos(rule.uid, force_fetch=True)
+        if not recent:
+            yield event.plain_result(f"ℹ️ UID {rule.uid} 最近没有获取到视频。")
+            return
+
+        card = await self.service.fetch_video_card(ParseTarget(bvid=recent[0].bvid))
+        result = await self._send_card_to_targets(card, list(rule.targets))
+        yield event.plain_result(
+            f"✅ 推送完成：成功目标 {result['target_success']}，失败目标 {result['target_failure']}。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_check_all")
+    async def bili_check_all(self, event: AstrMessageEvent):
+        rules = self._resolve_monitor_rules()
+        if not rules:
+            yield event.plain_result("❌ 没有可用的监控规则，请先在插件配置中填写订阅规则。")
+            return
+
+        yield event.plain_result(f"🔍 正在立即检查 {len(rules)} 条 B 站监控规则...")
+        summaries: List[str] = []
+        request_interval = safe_int(
+            self.runtime_config.get("request_interval", DEFAULT_REQUEST_INTERVAL_SECONDS),
+            DEFAULT_REQUEST_INTERVAL_SECONDS,
+            minimum=1,
+            maximum=60,
+        )
+        request_jitter = safe_int(
+            self.runtime_config.get("request_interval_jitter", 0),
+            0,
+            minimum=0,
+            maximum=30,
+        )
+
+        for index, rule in enumerate(rules):
+            if index > 0:
+                await asyncio.sleep(self._pick_interval(request_interval, request_jitter, minimum=1))
+            try:
+                recent = await self._check_uid_videos(rule.uid, force_fetch=True)
+                if not recent:
+                    summaries.append(f"ℹ️ UID {rule.uid} 没有获取到视频")
+                    continue
+                card = await self.service.fetch_video_card(ParseTarget(bvid=recent[0].bvid))
+                result = await self._send_card_to_targets(card, list(rule.targets))
+                if result["target_failure"] > 0:
+                    summaries.append(
+                        f"⚠️ UID {rule.uid} 部分成功：成功 {result['target_success']}，失败 {result['target_failure']}"
+                    )
+                else:
+                    summaries.append(f"✅ UID {rule.uid} 推送成功")
+            except Exception as err:
+                logger.error(f"BilibiliPush: 检查 UID {rule.uid} 失败: {err}")
+                summaries.append(f"❌ UID {rule.uid} 检查失败: {err}")
+
+        yield event.plain_result("\n".join(summaries))
+
+    async def run_monitor(self):
+        logger.info("BilibiliPush: 监控任务已启动")
+        await asyncio.sleep(STARTUP_DELAY_SECONDS)
+
+        while self.running:
+            try:
+                rules = self._resolve_monitor_rules()
+                interval = safe_int(
+                    self.runtime_config.get("check_interval", DEFAULT_CHECK_INTERVAL_MINUTES),
+                    DEFAULT_CHECK_INTERVAL_MINUTES,
+                    minimum=1,
+                    maximum=24 * 60,
+                )
+                jitter = safe_int(
+                    self.runtime_config.get("check_interval_jitter", 0),
+                    0,
+                    minimum=0,
+                    maximum=180,
+                )
+                sleep_minutes = self._pick_interval(interval, jitter, minimum=1)
+
+                if not rules:
+                    logger.debug("BilibiliPush: 当前无可用监控规则")
+                else:
+                    credential = await self.credential_manager.get_credential()
+                    if credential is None:
+                        logger.warning("BilibiliPush: 当前没有可用的 Bilibili 登录态，跳过本轮轮询")
+                    else:
+                        await self._run_monitor_cycle(rules)
+
+                logger.debug(f"BilibiliPush: 下次检查将在 {sleep_minutes} 分钟后执行")
+                await asyncio.sleep(sleep_minutes * 60)
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                logger.error(f"BilibiliPush: 监控循环异常: {err}")
+                await asyncio.sleep(60)
+
+    async def _run_monitor_cycle(self, rules: Sequence[MonitorRule]) -> None:
+        request_interval = safe_int(
+            self.runtime_config.get("request_interval", DEFAULT_REQUEST_INTERVAL_SECONDS),
+            DEFAULT_REQUEST_INTERVAL_SECONDS,
+            minimum=1,
+            maximum=60,
+        )
+        request_jitter = safe_int(
+            self.runtime_config.get("request_interval_jitter", 0),
+            0,
+            minimum=0,
+            maximum=30,
+        )
+
+        for index, rule in enumerate(rules):
+            if index > 0:
+                await asyncio.sleep(self._pick_interval(request_interval, request_jitter, minimum=1))
+            try:
+                new_items = await self._check_uid_videos(rule.uid)
+                if not new_items:
+                    continue
+                for item in new_items:
+                    card = await self.service.fetch_video_card(ParseTarget(bvid=item.bvid))
+                    await self._send_card_to_targets(card, list(rule.targets))
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                logger.error(f"BilibiliPush: 轮询 UID {rule.uid} 失败: {err}")
+
+
+def safe_int(value: Any, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    try:
+        number = int(value)
+    except Exception:
+        number = default
+    if minimum is not None and number < minimum:
+        number = minimum
+    if maximum is not None and number > maximum:
+        number = maximum
+    return number
+
+
+def extract_page_num(value: str) -> int:
+    try:
+        parsed = urlparse(ensure_scheme(value))
+        page = parse_qs(parsed.query).get("p", ["1"])[0]
+        return max(1, int(page))
+    except Exception:
+        return 1
+
+
+def strip_trailing_punctuation(value: str) -> str:
+    return value.strip().rstrip(TRAILING_PUNCTUATION)
+
+
+def ensure_scheme(value: str) -> str:
+    if value.startswith("http://") or value.startswith("https://") or value.startswith("bilibili://"):
+        return value
+    if value.startswith("space.bilibili.com") or value.startswith("b23.tv") or value.startswith("bili2233.cn") or value.startswith("www.bilibili.com") or value.startswith("m.bilibili.com"):
+        return f"https://{value}"
+    return value
+
+
+def iter_string_values(payload: Any) -> Iterable[str]:
+    if isinstance(payload, str):
+        yield payload
+        return
+    if isinstance(payload, dict):
+        for value in payload.values():
+            yield from iter_string_values(value)
+        return
+    if isinstance(payload, list):
+        for value in payload:
+            yield from iter_string_values(value)
+
+
+def extract_json_url(data: Any) -> Optional[str]:
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            return None
+    if not isinstance(data, dict):
+        return None
+
+    meta = data.get("meta")
+    if isinstance(meta, dict):
+        for key1, key2 in (
+            ("music", "musicUrl"),
+            ("detail_1", "qqdocurl"),
+            ("news", "jumpUrl"),
+            ("music", "jumpUrl"),
+        ):
+            section = meta.get(key1)
+            if isinstance(section, dict):
+                url = section.get(key2)
+                if isinstance(url, str) and url:
+                    return strip_trailing_punctuation(url)
+
+    for value in iter_string_values(data):
+        match = URL_PATTERN.search(value)
+        if match:
+            return strip_trailing_punctuation(match.group("url"))
+        match = BV_PATTERN.search(value)
+        if match:
+            return match.group("bvid")
+    return None
+
+
+def normalize_cover_url(url: str) -> str:
+    if not url:
+        return ""
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return f"https://{url.lstrip('/')}"
+
+
+def sanitize_desc(desc: str, limit: int) -> str:
+    cleaned = " ".join(str(desc or "").split())
+    if limit <= 0:
+        return cleaned
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1] + "…"
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def format_timestamp(timestamp: int) -> str:
+    if timestamp <= 0:
+        return "未知"
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_count(value: int) -> str:
+    value = max(0, int(value))
+    if value >= 100000000:
+        return f"{value / 100000000:.1f}亿"
+    if value >= 10000:
+        return f"{value / 10000:.1f}万"
+    return str(value)

@@ -1,0 +1,139 @@
+{
+  "auth_settings": {
+    "type": "object",
+    "description": "认证信息",
+    "hint": "支持直接填写 Cookie，也支持在群聊/私聊中通过指令扫码登录并持久化保存。",
+    "items": {
+      "bilibili_cookie": {
+        "type": "text",
+        "default": "",
+        "description": "Bilibili Cookie",
+        "hint": "可选。若填写，插件会优先校验并持久化该 Cookie；留空则使用扫码登录后保存在 data/plugin_data 下的凭证文件。"
+      }
+    }
+  },
+  "monitoring_settings": {
+    "type": "object",
+    "description": "监控规则",
+    "hint": "配置需要监控的 UP 主与接收推送的会话 ID。会话 ID 可用 AstrBot 内置命令 /sid 获取。",
+    "items": {
+      "subscription_rules": {
+        "type": "template_list",
+        "default": [],
+        "description": "UP 主订阅规则",
+        "templates": {
+          "subscription_rule": {
+            "name": "B站订阅规则",
+            "hint": "source 支持 UID、空间主页链接；allowed_targets 支持逗号或换行分隔多个会话。",
+            "items": {
+              "source": {
+                "type": "text",
+                "default": "",
+                "description": "UP 主 UID / 空间链接（可多个）",
+                "hint": "例如：12345678, https://space.bilibili.com/12345678"
+              },
+              "allowed_targets": {
+                "type": "text",
+                "default": "",
+                "description": "允许接收推送的会话 ID",
+                "hint": "例如：aiocqhttp:GroupMessage:123456789。支持英文逗号或换行分隔多个。"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "content_settings": {
+    "type": "object",
+    "description": "推送与解析内容",
+    "hint": "控制自动解析、消息模板和媒体附带行为。",
+    "items": {
+      "auto_parse_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "自动解析 B 站链接/卡片/BV 号"
+      },
+      "send_cover": {
+        "type": "bool",
+        "default": true,
+        "description": "附带封面图"
+      },
+      "send_direct_video": {
+        "type": "bool",
+        "default": false,
+        "description": "尝试发送直链视频",
+        "hint": "仅当 B 站返回单文件视频流时才会附带发送；若视频为 DASH 分离音视频，则自动回退为图文卡片。"
+      },
+      "video_codecs": {
+        "type": "string",
+        "default": "AVC",
+        "description": "直链视频编码优先级",
+        "options": ["AVC", "AV1", "HEV"]
+      },
+      "video_quality": {
+        "type": "string",
+        "default": "_720P",
+        "description": "直链视频清晰度",
+        "options": ["_360P", "_480P", "_720P", "_1080P", "_1080P_PLUS", "_1080P_60", "_4K", "HDR", "DOLBY", "_8K", "AI_REPAIR"],
+        "labels": ["360P 流畅", "480P 标清", "720P 高清", "1080P 全高清", "1080P+ 增强版", "1080P 60 帧", "4K 超高清", "HDR 高动态范围", "杜比视界", "8K 超高清", "AI 修复"]
+      },
+      "description_length": {
+        "type": "int",
+        "default": 120,
+        "description": "简介截断长度"
+      },
+      "parse_message_format": {
+        "type": "text",
+        "default": "📺 {title}\\nUP: {up_name}\\n时长: {duration}\\n发布时间: {pub_time}\\n播放: {view}  点赞: {like}  弹幕: {danmaku}\\n简介: {desc}\\n链接: {link}",
+        "description": "自动解析回复模板",
+        "hint": "支持变量：{title} {up_name} {duration} {pub_time} {view} {like} {danmaku} {reply} {favorite} {coin} {share} {desc} {link} {bvid} {aid} {tname} {part_title}"
+      },
+      "push_message_format": {
+        "type": "text",
+        "default": "🔔 {up_name} 投稿了新视频\\n\\n{title}\\n时长: {duration}\\n发布时间: {pub_time}\\n播放: {view}  点赞: {like}\\n简介: {desc}\\n链接: {link}",
+        "description": "订阅推送模板",
+        "hint": "支持与自动解析模板相同的变量。"
+      }
+    }
+  },
+  "runtime_settings": {
+    "type": "object",
+    "description": "运行参数",
+    "hint": "用于控制轮询频率、请求节奏与防抖。",
+    "items": {
+      "check_interval": {
+        "type": "int",
+        "default": 10,
+        "description": "检查间隔（分钟）"
+      },
+      "check_interval_jitter": {
+        "type": "int",
+        "default": 2,
+        "description": "检查间隔随机浮动（分钟）"
+      },
+      "request_interval": {
+        "type": "int",
+        "default": 2,
+        "description": "单次请求间隔（秒）"
+      },
+      "request_interval_jitter": {
+        "type": "int",
+        "default": 1,
+        "description": "请求间隔随机浮动（秒）"
+      },
+      "debounce_seconds": {
+        "type": "int",
+        "default": 300,
+        "description": "自动解析防抖秒数",
+        "hint": "同一会话内，重复的链接或视频在防抖时间内不会重复解析。"
+      },
+      "latest_fetch_limit": {
+        "type": "int",
+        "default": 5,
+        "description": "每轮拉取的最新视频数量",
+        "hint": "用于检查 UP 主空间最近投稿的窗口大小。"
+      }
+    }
+  }
+}

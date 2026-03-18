@@ -1,0 +1,22 @@
+name: astrbot_plugin_bilibili_push
+display_name: B站解析推送助手
+desc: 面向 AstrBot 的 Bilibili 视频自动解析与订阅推送插件，支持二维码登录持久化 Cookie。
+version: v0.1.0
+author: ZASENJC
+repo: https://github.com/ZASENJC/astrbot_plugin_bilibili_push
+astrbot_version: ">=4.10.4,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - wecom
+  - lark
+  - dingtalk
+  - discord
+  - slack
+  - kook
+  - vocechat
+  - weixin_official_account
+  - satori
+  - misskey
+  - line
