@@ -44,8 +44,8 @@
       "qq_link_emoji_enabled": {
         "type": "bool",
         "default": true,
-        "description": "QQ 链接/卡片前附带随机默认表情",
-        "hint": "当前仅 aiocqhttp（OneBot）平台生效。"
+        "description": "给原消息附加随机默认表情",
+        "hint": "识别到 QQ 链接或卡片时，尝试直接给触发解析的原消息附加表情。仅 aiocqhttp（OneBot）生效。"
       }
     }
   },

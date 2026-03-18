@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Face, Image, Json, Plain, Video as MessageVideo
+from astrbot.api.message_components import At, Image, Json, Plain, Video as MessageVideo
 from astrbot.api.star import Context, Star, StarTools
 from bilibili_api import Credential, request_settings, select_client
 from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
@@ -1059,15 +1059,91 @@ class Main(Star):
         template = self.push_template if push else self.parse_template
         return template.format_map(payload)
 
-    def _should_add_qq_face(self, event: AstrMessageEvent, target: ParseTarget) -> bool:
+    def _should_attach_qq_emoji(self, event: AstrMessageEvent, target: ParseTarget) -> bool:
         return (
             bool(self.passive_config.get("qq_link_emoji_enabled", True))
             and event.get_platform_id() == "aiocqhttp"
             and target.source_kind in {"link", "card"}
         )
 
-    def _build_random_qq_face_prefix(self) -> List[Any]:
-        return [Face(id=random.choice(QQ_DEFAULT_FACE_IDS)), Plain(" ")]
+    async def _attach_qq_emoji_reaction(self, event: AstrMessageEvent, target: ParseTarget) -> bool:
+        if not self._should_attach_qq_emoji(event, target):
+            return False
+
+        bot = getattr(event, "bot", None)
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if bot is None or raw is None:
+            return False
+
+        message_id = None
+        for key in ("message_id", "id"):
+            try:
+                if isinstance(raw, dict) and raw.get(key) is not None:
+                    message_id = raw.get(key)
+                    break
+                value = getattr(raw, key, None)
+                if value is not None:
+                    message_id = value
+                    break
+            except Exception:
+                continue
+
+        if message_id is None:
+            logger.debug("BilibiliPush: 当前消息缺少 message_id，无法附加 QQ 表情")
+            return False
+
+        emoji_id = str(random.choice(QQ_DEFAULT_FACE_IDS))
+        message_id_variants: List[Any] = [message_id]
+        try:
+            message_id_int = int(message_id)
+            if message_id_int not in message_id_variants:
+                message_id_variants.append(message_id_int)
+        except Exception:
+            pass
+
+        payload_candidates: List[Dict[str, Any]] = []
+        for message_id_variant in message_id_variants:
+            payload_candidates.extend(
+                [
+                    {"message_id": message_id_variant, "emoji_id": emoji_id},
+                    {"message_id": message_id_variant, "emoji_id": emoji_id, "set": True},
+                    {
+                        "message_id": message_id_variant,
+                        "emoji_id": emoji_id,
+                        "emoji_type": "1",
+                        "set": True,
+                    },
+                ]
+            )
+
+        action_error: Optional[Exception] = None
+        api = getattr(bot, "set_msg_emoji_like", None)
+        if callable(api):
+            for payload in payload_candidates:
+                try:
+                    await api(**payload)
+                    logger.debug(
+                        f"BilibiliPush: 已为消息 {message_id} 附加 QQ 表情 emoji_id={emoji_id}"
+                    )
+                    return True
+                except Exception as err:
+                    action_error = err
+
+        call_action = getattr(bot, "call_action", None)
+        if callable(call_action):
+            for payload in payload_candidates:
+                try:
+                    await call_action("set_msg_emoji_like", **payload)
+                    logger.debug(
+                        f"BilibiliPush: 已为消息 {message_id} 附加 QQ 表情 emoji_id={emoji_id}"
+                    )
+                    return True
+                except Exception as err:
+                    action_error = err
+
+        if action_error is not None:
+            logger.warning(f"BilibiliPush: 附加 QQ 表情失败: {action_error}")
+        return False
 
     def _media_cache_files(self) -> List[Path]:
         if not self.media_cache_dir.exists():
@@ -1163,9 +1239,6 @@ class Main(Star):
         target: Optional[ParseTarget] = None,
     ) -> MessageChain:
         chain = MessageChain()
-        if event is not None and target is not None and self._should_add_qq_face(event, target):
-            chain.chain.extend(self._build_random_qq_face_prefix())
-
         chain.message(self._render_video_text(card, push=push))
 
         if bool(self.content_config.get("send_cover", True)) and card.cover_url:
@@ -1202,13 +1275,6 @@ class Main(Star):
         if send_rich_text:
             chains.append(self._build_rich_text_chain(card, push=push, event=event, target=target))
         if video_chain is not None:
-            if (
-                not send_rich_text
-                and event is not None
-                and target is not None
-                and self._should_add_qq_face(event, target)
-            ):
-                video_chain.chain[0:0] = self._build_random_qq_face_prefix()
             chains.append(video_chain)
 
         if not chains:
@@ -1299,6 +1365,7 @@ class Main(Star):
 
             card = await self.service.fetch_video_card(target)
             await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
+            await self._attach_qq_emoji_reaction(event, target)
             if self.debouncer.hit_resource(event.unified_msg_origin, card.bvid or str(card.aid)):
                 return
 
