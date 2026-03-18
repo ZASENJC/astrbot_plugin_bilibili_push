@@ -1,30 +1,36 @@
 {
   "auth_settings": {
     "type": "object",
-    "description": "认证信息",
-    "hint": "支持直接填写 Cookie，也支持在群聊/私聊中通过指令扫码登录并持久化保存。",
+    "description": "B站登录",
+    "hint": "支持直接填写 Cookie，也支持在聊天里扫码登录并持久化保存。",
     "items": {
       "bilibili_cookie": {
         "type": "text",
         "default": "",
         "description": "Bilibili Cookie",
-        "hint": "可选。若填写，插件会优先校验并持久化该 Cookie；留空则使用扫码登录后保存在 data/plugin_data 下的凭证文件。"
+        "hint": "可选。填写后会优先校验并保存；留空时使用扫码登录得到的本地凭证。"
       }
     }
   },
   "passive_settings": {
     "type": "object",
     "description": "被动解析设置",
-    "hint": "主功能入口。控制哪些会话允许触发 B 站链接/卡片/BV 号被动解析。",
+    "hint": "控制哪些会话会自动识别和解析 B 站链接、卡片和 BV 号。",
     "items": {
+      "auto_parse_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "启用被动自动解析",
+        "hint": "关闭后不会自动识别聊天里的 B 站内容。"
+      },
       "session_whitelist": {
         "type": "list",
         "items": {
           "type": "string"
         },
         "default": [],
-        "description": "允许触发被动解析的会话白名单",
-        "hint": "留空表示不限制；填写后仅这些会话会触发被动解析。会话 ID 可用 /sid 获取。"
+        "description": "允许解析的会话白名单",
+        "hint": "留空表示不限制；填写后仅这些会话会触发解析。会话 ID 可用 /sid 获取。"
       },
       "session_blacklist": {
         "type": "list",
@@ -32,29 +38,30 @@
           "type": "string"
         },
         "default": [],
-        "description": "被动解析会话黑名单",
-        "hint": "黑名单优先级低于白名单判断，高于默认全开。也可用指令 /bili_parse_off 和 /bili_parse_on 管理当前会话。"
+        "description": "禁止解析的会话黑名单",
+        "hint": "这些会话不会触发解析，也可配合 /bili_parse_on 和 /bili_parse_off 使用。"
       },
       "qq_link_emoji_enabled": {
         "type": "bool",
         "default": true,
-        "description": "QQ 链接/卡片解析时附带 /zy 表情"
+        "description": "QQ 链接/卡片前附带随机默认表情",
+        "hint": "当前仅 aiocqhttp（OneBot）平台生效。"
       }
     }
   },
   "monitoring_settings": {
     "type": "object",
-    "description": "监控规则",
-    "hint": "配置需要监控的 UP 主与接收推送的会话 ID。会话 ID 可用 AstrBot 内置命令 /sid 获取。",
+    "description": "主动监控规则",
+    "hint": "配置需要轮询的 UP 主，以及接收主动推送的会话。",
     "items": {
       "subscription_rules": {
         "type": "template_list",
         "default": [],
-        "description": "UP 主订阅规则",
+        "description": "UP 主监控列表",
         "templates": {
           "subscription_rule": {
-            "name": "B站订阅规则",
-            "hint": "source 支持 UID、空间主页链接；allowed_targets 支持逗号或换行分隔多个会话。",
+            "name": "B站主动监控",
+            "hint": "source 支持 UID 或空间链接；allowed_targets 支持逗号或换行分隔多个会话。",
             "items": {
               "source": {
                 "type": "text",
@@ -65,7 +72,7 @@
               "allowed_targets": {
                 "type": "text",
                 "default": "",
-                "description": "允许接收推送的会话 ID",
+                "description": "接收推送的会话 ID",
                 "hint": "例如：aiocqhttp:GroupMessage:123456789。支持英文逗号或换行分隔多个。"
               }
             }
@@ -77,23 +84,36 @@
   "content_settings": {
     "type": "object",
     "description": "推送与解析内容",
-    "hint": "控制自动解析、消息模板和媒体附带行为。",
+    "hint": "控制视频发送、图文发送和图文模板。当前仅适配 aiocqhttp（OneBot）。",
     "items": {
-      "auto_parse_enabled": {
-        "type": "bool",
-        "default": true,
-        "description": "启用被动自动解析"
-      },
       "send_direct_video": {
         "type": "bool",
         "default": true,
-        "description": "默认优先直接发送视频",
-        "hint": "关闭后只发送文本和封面图。开启时会优先下载并发送视频文件；失败时自动回退为图文卡片。"
+        "description": "优先发送视频",
+        "hint": "开启后会尝试下载并发送视频；若视频不可用，会自动回退为图文。"
+      },
+      "send_rich_text": {
+        "type": "bool",
+        "default": false,
+        "description": "同时发送图文",
+        "hint": "开启后会在视频之外再发送图文；关闭后默认只发视频。若视频关闭或视频不可用，也会自动发送图文。"
       },
       "send_cover": {
         "type": "bool",
         "default": true,
-        "description": "未发送视频时附带封面图"
+        "description": "图文消息附带封面图"
+      },
+      "video_max_duration_minutes": {
+        "type": "int",
+        "default": 30,
+        "description": "视频发送时长上限（分钟）",
+        "hint": "超过这个时长时强制改为发送图文；填 0 表示不限制。"
+      },
+      "video_max_size_mb": {
+        "type": "int",
+        "default": 90,
+        "description": "视频发送大小上限（MB）",
+        "hint": "超过上限时强制改为发送图文。"
       },
       "video_codecs": {
         "type": "string",
@@ -104,33 +124,33 @@
       "video_quality": {
         "type": "string",
         "default": "_720P",
-        "description": "视频清晰度",
+        "description": "视频清晰度优先级",
         "options": ["_360P", "_480P", "_720P", "_1080P", "_1080P_PLUS", "_1080P_60", "_4K", "HDR", "DOLBY", "_8K", "AI_REPAIR"],
         "labels": ["360P 流畅", "480P 标清", "720P 高清", "1080P 全高清", "1080P+ 增强版", "1080P 60 帧", "4K 超高清", "HDR 高动态范围", "杜比视界", "8K 超高清", "AI 修复"]
       },
       "description_length": {
         "type": "int",
         "default": 120,
-        "description": "简介截断长度"
+        "description": "图文简介截断长度"
       },
       "parse_message_format": {
         "type": "text",
         "default": "📺 {title}\\nUP: {up_name}\\n时长: {duration}\\n发布时间: {pub_time}\\n播放: {view}  点赞: {like}  弹幕: {danmaku}\\n简介: {desc}\\n链接: {link}",
-        "description": "被动解析回复模板",
-        "hint": "支持变量：{title} {up_name} {duration} {pub_time} {view} {like} {danmaku} {reply} {favorite} {coin} {share} {desc} {link} {bvid} {aid} {tname} {part_title}"
+        "description": "图文回复模板",
+        "hint": "仅图文消息使用。支持变量：{title} {up_name} {duration} {pub_time} {view} {like} {danmaku} {reply} {favorite} {coin} {share} {desc} {link} {bvid} {aid} {tname} {part_title}"
       },
       "push_message_format": {
         "type": "text",
         "default": "🔔 {up_name} 投稿了新视频\\n\\n{title}\\n时长: {duration}\\n发布时间: {pub_time}\\n播放: {view}  点赞: {like}\\n简介: {desc}\\n链接: {link}",
-        "description": "订阅推送模板",
-        "hint": "支持与被动解析模板相同的变量。"
+        "description": "主动推送图文模板",
+        "hint": "仅图文消息使用。支持与上方相同的变量。"
       }
     }
   },
   "runtime_settings": {
     "type": "object",
     "description": "运行参数",
-    "hint": "用于控制轮询频率、请求节奏、视频下载限制与防抖。",
+    "hint": "控制轮询频率、请求间隔、下载超时和被动解析防抖。",
     "items": {
       "check_interval": {
         "type": "int",
@@ -156,25 +176,18 @@
         "type": "int",
         "default": 300,
         "description": "被动解析防抖秒数",
-        "hint": "同一会话内，重复的链接或视频在防抖时间内不会重复解析。"
+        "hint": "同一会话里，重复链接或同一视频在防抖时间内不会重复解析。"
       },
       "latest_fetch_limit": {
         "type": "int",
         "default": 5,
-        "description": "每轮拉取的最新视频数量",
-        "hint": "用于检查 UP 主空间最近投稿的窗口大小。"
-      },
-      "video_max_size_mb": {
-        "type": "int",
-        "default": 90,
-        "description": "视频发送大小上限（MB）",
-        "hint": "下载或合并后超出该大小时，将自动回退为图文卡片。"
+        "description": "每轮拉取的最新视频数量"
       },
       "video_download_timeout": {
         "type": "int",
         "default": 300,
         "description": "视频下载超时（秒）",
-        "hint": "用于被动解析和订阅推送中的视频下载阶段。"
+        "hint": "用于视频下载阶段。"
       }
     }
   }

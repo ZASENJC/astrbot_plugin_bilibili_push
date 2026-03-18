@@ -29,7 +29,7 @@ from bilibili_api.video import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_bilibili_push"
-QQ_ZAN_FACE_ID = 76
+QQ_DEFAULT_FACE_IDS = (1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 16, 21, 24)
 
 DEFAULT_CHECK_INTERVAL_MINUTES = 10
 DEFAULT_REQUEST_INTERVAL_SECONDS = 2
@@ -39,6 +39,9 @@ DEFAULT_DEBOUNCE_SECONDS = 300
 DEFAULT_FETCH_LIMIT = 5
 DEFAULT_DESC_LENGTH = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 90
+DEFAULT_VIDEO_MAX_DURATION_MINUTES = 30
+MEDIA_CACHE_DAILY_CLEANUP_SECONDS = 24 * 60 * 60
+MEDIA_CACHE_FORCE_LIMIT_BYTES = 1024 * 1024 * 1024
 STARTUP_DELAY_SECONDS = 10
 QR_POLL_SECONDS = 2
 QR_MAX_POLLS = 45
@@ -370,6 +373,33 @@ class BilibiliService:
             "Origin": "https://www.bilibili.com",
         }
 
+    def _video_push_requested(self) -> bool:
+        content_config = self.content_config_getter() or {}
+        return bool(content_config.get("send_direct_video", True))
+
+    def _video_duration_limit_seconds(self) -> int:
+        content_config = self.content_config_getter() or {}
+        limit_minutes = safe_int(
+            content_config.get(
+                "video_max_duration_minutes",
+                DEFAULT_VIDEO_MAX_DURATION_MINUTES,
+            ),
+            DEFAULT_VIDEO_MAX_DURATION_MINUTES,
+            minimum=0,
+            maximum=24 * 60,
+        )
+        if limit_minutes <= 0:
+            return 0
+        return limit_minutes * 60
+
+    def _should_attempt_video_download(self, duration_seconds: int) -> bool:
+        if not self._video_push_requested():
+            return False
+        limit_seconds = self._video_duration_limit_seconds()
+        if limit_seconds > 0 and duration_seconds > limit_seconds:
+            return False
+        return True
+
     def resolve_uid(self, source: str) -> Optional[int]:
         candidate = source.strip()
         if not candidate:
@@ -449,8 +479,10 @@ class BilibiliService:
         if page_index > 0:
             link += f"?p={page_index + 1}"
 
+        duration_seconds = safe_int(page_info.get("duration") or info.get("duration"), 0)
+
         video_path: Optional[Path] = None
-        if bool(self.content_config_getter().get("send_direct_video", True)):
+        if self._should_attempt_video_download(duration_seconds):
             try:
                 video_path = await self._prepare_video_file(video, bvid, page_index)
             except MediaSizeLimitError as err:
@@ -466,7 +498,7 @@ class BilibiliService:
             up_name=str(owner.get("name") or "未知UP"),
             cover_url=normalize_cover_url(info.get("pic") or ""),
             desc=str(info.get("desc") or ""),
-            duration_seconds=safe_int(page_info.get("duration") or info.get("duration"), 0),
+            duration_seconds=duration_seconds,
             pub_ts=pub_ts,
             view=safe_int(stat.get("view"), 0),
             like=safe_int(stat.get("like"), 0),
@@ -485,7 +517,10 @@ class BilibiliService:
         content_config = self.content_config_getter() or {}
 
         max_size_mb = safe_int(
-            runtime_config.get("video_max_size_mb", DEFAULT_VIDEO_MAX_SIZE_MB),
+            content_config.get(
+                "video_max_size_mb",
+                runtime_config.get("video_max_size_mb", DEFAULT_VIDEO_MAX_SIZE_MB),
+            ),
             DEFAULT_VIDEO_MAX_SIZE_MB,
             minimum=10,
             maximum=2048,
@@ -810,6 +845,12 @@ class Main(Star):
         return self.config.get("runtime_settings", {}) or {}
 
     @property
+    def auto_parse_enabled(self) -> bool:
+        if "auto_parse_enabled" in self.passive_config:
+            return bool(self.passive_config.get("auto_parse_enabled", True))
+        return bool(self.content_config.get("auto_parse_enabled", True))
+
+    @property
     def debounce_seconds(self) -> int:
         return safe_int(
             self.runtime_config.get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS),
@@ -820,7 +861,10 @@ class Main(Star):
 
     @property
     def parse_template(self) -> str:
-        template = self.content_config.get("parse_message_format", DEFAULT_PARSE_TEMPLATE)
+        template = self.content_config.get(
+            "rich_message_format",
+            self.content_config.get("parse_message_format", DEFAULT_PARSE_TEMPLATE),
+        )
         return str(template or DEFAULT_PARSE_TEMPLATE).replace("\\n", "\n")
 
     @property
@@ -828,9 +872,16 @@ class Main(Star):
         template = self.content_config.get("push_message_format", DEFAULT_PUSH_TEMPLATE)
         return str(template or DEFAULT_PUSH_TEMPLATE).replace("\\n", "\n")
 
+    def _send_direct_video_enabled(self) -> bool:
+        return bool(self.content_config.get("send_direct_video", True))
+
+    def _send_rich_text_enabled(self) -> bool:
+        return bool(self.content_config.get("send_rich_text", False))
+
     async def initialize(self):
         self.running = True
         self.debouncer.update_ttl(self.debounce_seconds)
+        await self._cleanup_media_cache(force=False)
         self.monitor_task = asyncio.create_task(self.run_monitor())
 
     async def terminate(self):
@@ -1015,7 +1066,95 @@ class Main(Star):
             and target.source_kind in {"link", "card"}
         )
 
-    def _build_message_chain(
+    def _build_random_qq_face_prefix(self) -> List[Any]:
+        return [Face(id=random.choice(QQ_DEFAULT_FACE_IDS)), Plain(" ")]
+
+    def _media_cache_files(self) -> List[Path]:
+        if not self.media_cache_dir.exists():
+            return []
+        return [path for path in self.media_cache_dir.rglob("*") if path.is_file()]
+
+    def _media_cache_usage_bytes(self, files: Optional[Sequence[Path]] = None) -> int:
+        total = 0
+        for path in files or self._media_cache_files():
+            try:
+                total += path.stat().st_size
+            except FileNotFoundError:
+                continue
+        return total
+
+    async def _cleanup_media_cache(
+        self,
+        *,
+        force: bool,
+        keep_paths: Optional[Sequence[Optional[Path]]] = None,
+    ) -> Dict[str, Any]:
+        files = self._media_cache_files()
+        before_bytes = self._media_cache_usage_bytes(files)
+        last_cleanup_ts = safe_int(self._state_get("media_cache_last_cleanup_ts", 0), 0)
+        now_ts = int(time.time())
+        cleanup_due = now_ts - last_cleanup_ts >= MEDIA_CACHE_DAILY_CLEANUP_SECONDS
+        over_limit = before_bytes >= MEDIA_CACHE_FORCE_LIMIT_BYTES
+        should_cleanup = bool(files) and (force or over_limit or cleanup_due)
+
+        if not should_cleanup:
+            return {
+                "cleaned": False,
+                "force": force or over_limit,
+                "before_bytes": before_bytes,
+                "after_bytes": before_bytes,
+                "removed_files": 0,
+                "removed_bytes": 0,
+            }
+
+        keep_set = {
+            str(path.resolve())
+            for path in (keep_paths or [])
+            if path is not None and path.exists()
+        }
+        removed_files = 0
+        removed_bytes = 0
+
+        for path in files:
+            try:
+                if str(path.resolve()) in keep_set:
+                    continue
+                size = path.stat().st_size
+                path.unlink(missing_ok=True)
+                removed_files += 1
+                removed_bytes += size
+            except FileNotFoundError:
+                continue
+            except Exception as err:
+                logger.warning(f"BilibiliPush: 删除缓存文件失败 {path}: {err}")
+
+        for directory in sorted(
+            [path for path in self.media_cache_dir.rglob("*") if path.is_dir()],
+            reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                continue
+
+        self.media_cache_dir.mkdir(parents=True, exist_ok=True)
+        after_bytes = self._media_cache_usage_bytes()
+        self._state_update({"media_cache_last_cleanup_ts": now_ts})
+        logger.info(
+            "BilibiliPush: 媒体缓存清理完成 "
+            f"(force={force or over_limit}, before={format_bytes(before_bytes)}, "
+            f"after={format_bytes(after_bytes)}, removed_files={removed_files})"
+        )
+        return {
+            "cleaned": True,
+            "force": force or over_limit,
+            "before_bytes": before_bytes,
+            "after_bytes": after_bytes,
+            "removed_files": removed_files,
+            "removed_bytes": removed_bytes,
+        }
+
+    def _build_rich_text_chain(
         self,
         card: VideoCard,
         *,
@@ -1025,26 +1164,69 @@ class Main(Star):
     ) -> MessageChain:
         chain = MessageChain()
         if event is not None and target is not None and self._should_add_qq_face(event, target):
-            chain.chain.append(Face(id=QQ_ZAN_FACE_ID))
-            chain.chain.append(Plain(" "))
+            chain.chain.extend(self._build_random_qq_face_prefix())
 
         chain.message(self._render_video_text(card, push=push))
 
-        if card.video_path is not None:
-            chain.chain.append(MessageVideo.fromFileSystem(str(card.video_path)))
-        elif bool(self.content_config.get("send_cover", True)) and card.cover_url:
+        if bool(self.content_config.get("send_cover", True)) and card.cover_url:
             chain.url_image(card.cover_url)
 
         return chain
+
+    def _build_video_chain(
+        self,
+        card: VideoCard,
+        *,
+        event: Optional[AstrMessageEvent] = None,
+        target: Optional[ParseTarget] = None,
+    ) -> Optional[MessageChain]:
+        if card.video_path is None or not self._send_direct_video_enabled():
+            return None
+
+        chain = MessageChain()
+        chain.chain.append(MessageVideo.fromFileSystem(str(card.video_path)))
+        return chain
+
+    def _build_message_chains(
+        self,
+        card: VideoCard,
+        *,
+        push: bool,
+        event: Optional[AstrMessageEvent] = None,
+        target: Optional[ParseTarget] = None,
+    ) -> List[MessageChain]:
+        chains: List[MessageChain] = []
+        video_chain = self._build_video_chain(card, event=event, target=target)
+        send_rich_text = self._send_rich_text_enabled() or video_chain is None
+
+        if send_rich_text:
+            chains.append(self._build_rich_text_chain(card, push=push, event=event, target=target))
+        if video_chain is not None:
+            if (
+                not send_rich_text
+                and event is not None
+                and target is not None
+                and self._should_add_qq_face(event, target)
+            ):
+                video_chain.chain[0:0] = self._build_random_qq_face_prefix()
+            chains.append(video_chain)
+
+        if not chains:
+            chains.append(self._build_rich_text_chain(card, push=push, event=event, target=target))
+
+        return chains
 
     async def _send_card_to_targets(self, card: VideoCard, targets: Sequence[str]) -> Dict[str, int]:
         success = 0
         failure = 0
         for target in targets:
             try:
-                chain = self._build_message_chain(card, push=True)
-                sent = await self.context.send_message(target, chain)
-                if sent:
+                chains = self._build_message_chains(card, push=True)
+                send_success = True
+                for chain in chains:
+                    sent = await self.context.send_message(target, chain)
+                    send_success = send_success and bool(sent)
+                if send_success:
                     success += 1
                 else:
                     failure += 1
@@ -1091,7 +1273,7 @@ class Main(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        if not bool(self.content_config.get("auto_parse_enabled", True)):
+        if not self.auto_parse_enabled:
             return
         if not self._is_passive_session_allowed(event):
             return
@@ -1116,11 +1298,13 @@ class Main(Star):
                 return
 
             card = await self.service.fetch_video_card(target)
+            await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
             if self.debouncer.hit_resource(event.unified_msg_origin, card.bvid or str(card.aid)):
                 return
 
-            chain = self._build_message_chain(card, push=False, event=event, target=target)
-            yield event.chain_result(chain.chain)
+            chains = self._build_message_chains(card, push=False, event=event, target=target)
+            for chain in chains:
+                yield event.chain_result(chain.chain)
         except asyncio.CancelledError:
             raise
         except Exception as err:
@@ -1152,6 +1336,25 @@ class Main(Star):
             return
         await self.credential_manager.clear()
         yield event.plain_result("✅ 已清除本地持久化的 Bilibili 登录态。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_clear_cache", alias={"清理B站缓存", "清理b站缓存", "bili_cache_clear"})
+    async def bili_clear_cache(self, event: AstrMessageEvent):
+        if not self._is_bot_owner(event):
+            yield event.plain_result("❌ 此指令仅机器人主人可用。")
+            return
+        result = await self._cleanup_media_cache(force=True)
+        if not result["cleaned"]:
+            yield event.plain_result(
+                f"ℹ️ 当前没有可清理的媒体缓存，缓存占用 {format_bytes(result['before_bytes'])}。"
+            )
+            return
+        yield event.plain_result(
+            "✅ 媒体缓存已清理："
+            f"删除 {result['removed_files']} 个文件，"
+            f"释放 {format_bytes(result['removed_bytes'])}，"
+            f"剩余 {format_bytes(result['after_bytes'])}。"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_parse_on", alias={"开启B站解析", "开启b站解析"})
@@ -1190,8 +1393,9 @@ class Main(Star):
                     yield event.plain_result(f"ℹ️ UID {uid} 最近没有获取到视频。")
                     return
                 card = await self.service.fetch_video_card(ParseTarget(bvid=recent[0].bvid))
-                chain = self._build_message_chain(card, push=True)
-                await self.context.send_message(event.unified_msg_origin, chain)
+                await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
+                for chain in self._build_message_chains(card, push=True):
+                    await self.context.send_message(event.unified_msg_origin, chain)
                 yield event.plain_result(f"✅ 已向当前会话发送 UID {uid} 的最新视频。")
             except Exception as err:
                 logger.error(f"BilibiliPush: 手动检查失败: {err}")
@@ -1210,6 +1414,7 @@ class Main(Star):
             return
 
         card = await self.service.fetch_video_card(ParseTarget(bvid=recent[0].bvid))
+        await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
         result = await self._send_card_to_targets(card, list(rule.targets))
         yield event.plain_result(
             f"✅ 推送完成：成功目标 {result['target_success']}，失败目标 {result['target_failure']}。"
@@ -1247,6 +1452,7 @@ class Main(Star):
                     summaries.append(f"ℹ️ UID {rule.uid} 没有获取到视频")
                     continue
                 card = await self.service.fetch_video_card(ParseTarget(bvid=recent[0].bvid))
+                await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
                 result = await self._send_card_to_targets(card, list(rule.targets))
                 if result["target_failure"] > 0:
                     summaries.append(
@@ -1288,6 +1494,7 @@ class Main(Star):
                     if credential is None:
                         logger.warning("BilibiliPush: 当前没有可用的 Bilibili 登录态，跳过本轮轮询")
                     else:
+                        await self._cleanup_media_cache(force=False)
                         await self._run_monitor_cycle(rules)
 
                 logger.debug(f"BilibiliPush: 下次检查将在 {sleep_minutes} 分钟后执行")
@@ -1321,6 +1528,7 @@ class Main(Star):
                     continue
                 for item in new_items:
                     card = await self.service.fetch_video_card(ParseTarget(bvid=item.bvid))
+                    await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
                     await self._send_card_to_targets(card, list(rule.targets))
             except asyncio.CancelledError:
                 raise
@@ -1448,6 +1656,19 @@ def format_count(value: int) -> str:
     if value >= 10000:
         return f"{value / 10000:.1f}万"
     return str(value)
+
+
+def format_bytes(value: int) -> str:
+    value = max(0, int(value))
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{value} B"
 
 
 def suffix_from_url(url: str, default: str) -> str:
