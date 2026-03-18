@@ -12,6 +12,36 @@
       }
     }
   },
+  "passive_settings": {
+    "type": "object",
+    "description": "被动解析设置",
+    "hint": "主功能入口。控制哪些会话允许触发 B 站链接/卡片/BV 号被动解析。",
+    "items": {
+      "session_whitelist": {
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "允许触发被动解析的会话白名单",
+        "hint": "留空表示不限制；填写后仅这些会话会触发被动解析。会话 ID 可用 /sid 获取。"
+      },
+      "session_blacklist": {
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "被动解析会话黑名单",
+        "hint": "黑名单优先级低于白名单判断，高于默认全开。也可用指令 /bili_parse_off 和 /bili_parse_on 管理当前会话。"
+      },
+      "qq_link_emoji_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "QQ 链接/卡片解析时附带 /zy 表情"
+      }
+    }
+  },
   "monitoring_settings": {
     "type": "object",
     "description": "监控规则",
@@ -52,29 +82,29 @@
       "auto_parse_enabled": {
         "type": "bool",
         "default": true,
-        "description": "自动解析 B 站链接/卡片/BV 号"
+        "description": "启用被动自动解析"
+      },
+      "send_direct_video": {
+        "type": "bool",
+        "default": true,
+        "description": "默认优先直接发送视频",
+        "hint": "关闭后只发送文本和封面图。开启时会优先下载并发送视频文件；失败时自动回退为图文卡片。"
       },
       "send_cover": {
         "type": "bool",
         "default": true,
-        "description": "附带封面图"
-      },
-      "send_direct_video": {
-        "type": "bool",
-        "default": false,
-        "description": "尝试发送直链视频",
-        "hint": "仅当 B 站返回单文件视频流时才会附带发送；若视频为 DASH 分离音视频，则自动回退为图文卡片。"
+        "description": "未发送视频时附带封面图"
       },
       "video_codecs": {
         "type": "string",
         "default": "AVC",
-        "description": "直链视频编码优先级",
+        "description": "视频编码优先级",
         "options": ["AVC", "AV1", "HEV"]
       },
       "video_quality": {
         "type": "string",
         "default": "_720P",
-        "description": "直链视频清晰度",
+        "description": "视频清晰度",
         "options": ["_360P", "_480P", "_720P", "_1080P", "_1080P_PLUS", "_1080P_60", "_4K", "HDR", "DOLBY", "_8K", "AI_REPAIR"],
         "labels": ["360P 流畅", "480P 标清", "720P 高清", "1080P 全高清", "1080P+ 增强版", "1080P 60 帧", "4K 超高清", "HDR 高动态范围", "杜比视界", "8K 超高清", "AI 修复"]
       },
@@ -86,21 +116,21 @@
       "parse_message_format": {
         "type": "text",
         "default": "📺 {title}\\nUP: {up_name}\\n时长: {duration}\\n发布时间: {pub_time}\\n播放: {view}  点赞: {like}  弹幕: {danmaku}\\n简介: {desc}\\n链接: {link}",
-        "description": "自动解析回复模板",
+        "description": "被动解析回复模板",
         "hint": "支持变量：{title} {up_name} {duration} {pub_time} {view} {like} {danmaku} {reply} {favorite} {coin} {share} {desc} {link} {bvid} {aid} {tname} {part_title}"
       },
       "push_message_format": {
         "type": "text",
         "default": "🔔 {up_name} 投稿了新视频\\n\\n{title}\\n时长: {duration}\\n发布时间: {pub_time}\\n播放: {view}  点赞: {like}\\n简介: {desc}\\n链接: {link}",
         "description": "订阅推送模板",
-        "hint": "支持与自动解析模板相同的变量。"
+        "hint": "支持与被动解析模板相同的变量。"
       }
     }
   },
   "runtime_settings": {
     "type": "object",
     "description": "运行参数",
-    "hint": "用于控制轮询频率、请求节奏与防抖。",
+    "hint": "用于控制轮询频率、请求节奏、视频下载限制与防抖。",
     "items": {
       "check_interval": {
         "type": "int",
@@ -125,7 +155,7 @@
       "debounce_seconds": {
         "type": "int",
         "default": 300,
-        "description": "自动解析防抖秒数",
+        "description": "被动解析防抖秒数",
         "hint": "同一会话内，重复的链接或视频在防抖时间内不会重复解析。"
       },
       "latest_fetch_limit": {
@@ -133,6 +163,18 @@
         "default": 5,
         "description": "每轮拉取的最新视频数量",
         "hint": "用于检查 UP 主空间最近投稿的窗口大小。"
+      },
+      "video_max_size_mb": {
+        "type": "int",
+        "default": 90,
+        "description": "视频发送大小上限（MB）",
+        "hint": "下载或合并后超出该大小时，将自动回退为图文卡片。"
+      },
+      "video_download_timeout": {
+        "type": "int",
+        "default": 300,
+        "description": "视频下载超时（秒）",
+        "hint": "用于被动解析和订阅推送中的视频下载阶段。"
       }
     }
   }

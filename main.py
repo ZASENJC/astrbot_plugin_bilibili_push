@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Image, Json, Video as MessageVideo
+from astrbot.api.message_components import At, Face, Image, Json, Plain, Video as MessageVideo
 from astrbot.api.star import Context, Star, StarTools
 from bilibili_api import Credential, request_settings, select_client
 from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
@@ -29,12 +29,16 @@ from bilibili_api.video import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_bilibili_push"
+QQ_ZAN_FACE_ID = 76
+
 DEFAULT_CHECK_INTERVAL_MINUTES = 10
 DEFAULT_REQUEST_INTERVAL_SECONDS = 2
 DEFAULT_TIMEOUT_SECONDS = 20
+DEFAULT_VIDEO_DOWNLOAD_TIMEOUT_SECONDS = 300
 DEFAULT_DEBOUNCE_SECONDS = 300
 DEFAULT_FETCH_LIMIT = 5
 DEFAULT_DESC_LENGTH = 120
+DEFAULT_VIDEO_MAX_SIZE_MB = 90
 STARTUP_DELAY_SECONDS = 10
 QR_POLL_SECONDS = 2
 QR_MAX_POLLS = 45
@@ -64,10 +68,22 @@ URL_PATTERN = re.compile(
 )
 BV_PATTERN = re.compile(r"\b(?P<bvid>BV[0-9A-Za-z]{10})\b")
 AV_PATTERN = re.compile(r"\b(?P<avid>av\d{6,})\b", re.IGNORECASE)
-VIDEO_BV_URL_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?bilibili\.com/video/(?P<bvid>BV[0-9A-Za-z]{10})", re.IGNORECASE)
-VIDEO_AV_URL_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?bilibili\.com/video/(?P<avid>av\d{6,})", re.IGNORECASE)
-SHORT_URL_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?(?:b23\.tv|bili2233\.cn)/", re.IGNORECASE)
-SPACE_UID_PATTERN = re.compile(r"(?:https?://)?space\.bilibili\.com/(?P<uid>\d+)", re.IGNORECASE)
+VIDEO_BV_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?bilibili\.com/video/(?P<bvid>BV[0-9A-Za-z]{10})",
+    re.IGNORECASE,
+)
+VIDEO_AV_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?bilibili\.com/video/(?P<avid>av\d{6,})",
+    re.IGNORECASE,
+)
+SHORT_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:b23\.tv|bili2233\.cn)/",
+    re.IGNORECASE,
+)
+SPACE_UID_PATTERN = re.compile(
+    r"(?:https?://)?space\.bilibili\.com/(?P<uid>\d+)",
+    re.IGNORECASE,
+)
 SPACE_UID_QUERY_PATTERN = re.compile(r"(?:uid|mid|vmid)=(?P<uid>\d+)", re.IGNORECASE)
 BILIBILI_SCHEME_AV_PATTERN = re.compile(r"bilibili://video/av(?P<avid>\d+)", re.IGNORECASE)
 TRAILING_PUNCTUATION = "'\"）)]】}>，。！？；：,.!?;:"
@@ -78,6 +94,14 @@ try:
     request_settings.set("impersonate", "chrome131")
 except Exception as err:
     logger.warning(f"BilibiliPush: 初始化 bilibili-api 客户端失败，将使用默认客户端: {err}")
+
+
+class MediaDownloadError(Exception):
+    pass
+
+
+class MediaSizeLimitError(MediaDownloadError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -96,6 +120,15 @@ class FeedVideoItem:
     author: str
     cover_url: str = ""
     desc: str = ""
+
+
+@dataclass
+class ParseTarget:
+    bvid: Optional[str] = None
+    aid: Optional[int] = None
+    page_num: int = 1
+    raw_input: str = ""
+    source_kind: str = "code"
 
 
 @dataclass
@@ -118,19 +151,11 @@ class VideoCard:
     share: int
     tname: str = ""
     part_title: str = ""
-    direct_video_url: Optional[str] = None
+    video_path: Optional[Path] = None
 
     @property
     def duration_text(self) -> str:
         return format_duration(self.duration_seconds)
-
-
-@dataclass
-class ParseTarget:
-    bvid: Optional[str] = None
-    aid: Optional[int] = None
-    page_num: int = 1
-    raw_input: str = ""
 
 
 class SafeFormatDict(dict):
@@ -176,7 +201,6 @@ class DebounceCache:
 
 class BilibiliCredentialManager:
     def __init__(self, data_dir: Path, auth_config_getter) -> None:
-        self.data_dir = data_dir
         self.credential_file = data_dir / "bilibili_credential.json"
         self.auth_config_getter = auth_config_getter
         self._credential: Optional[Credential] = None
@@ -294,11 +318,10 @@ class BilibiliCredentialManager:
                 if scan_tip_pending:
                     yield "二维码已扫描，请在哔哩哔哩客户端确认登录。"
                     scan_tip_pending = False
-            elif state == QrCodeLoginEvents.SCAN:
-                pass
             elif state == QrCodeLoginEvents.TIMEOUT:
                 yield "二维码已过期，请重新执行登录指令。"
                 return
+
             await asyncio.sleep(QR_POLL_SECONDS)
 
         yield "二维码登录超时，请重新执行登录指令。"
@@ -333,15 +356,19 @@ class BilibiliService:
         client: httpx.AsyncClient,
         credential_manager: BilibiliCredentialManager,
         content_config_getter,
+        runtime_config_getter,
+        cache_dir: Path,
     ) -> None:
         self.client = client
         self.credential_manager = credential_manager
         self.content_config_getter = content_config_getter
-
-    async def resolve_short_url(self, url: str) -> str:
-        normalized = ensure_scheme(strip_trailing_punctuation(url))
-        response = await self.client.get(normalized, follow_redirects=True)
-        return str(response.url)
+        self.runtime_config_getter = runtime_config_getter
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.default_headers = {
+            "Referer": "https://www.bilibili.com/",
+            "Origin": "https://www.bilibili.com",
+        }
 
     def resolve_uid(self, source: str) -> Optional[int]:
         candidate = source.strip()
@@ -354,6 +381,11 @@ class BilibiliService:
         if match := SPACE_UID_QUERY_PATTERN.search(candidate):
             return int(match.group("uid"))
         return None
+
+    async def resolve_short_url(self, url: str) -> str:
+        normalized = ensure_scheme(strip_trailing_punctuation(url))
+        response = await self.client.get(normalized, follow_redirects=True)
+        return str(response.url)
 
     async def fetch_recent_videos(self, uid: int, limit: int) -> List[FeedVideoItem]:
         credential = await self.credential_manager.get_credential()
@@ -408,10 +440,6 @@ class BilibiliService:
         if len(pages) > 1 and part_title and part_title != title:
             title = f"{title} [P{page_index + 1} {part_title}]"
 
-        direct_video_url = None
-        if bool(self.content_config_getter().get("send_direct_video", False)):
-            direct_video_url = await self._extract_direct_video_url(video, page_index)
-
         stat = info.get("stat") or {}
         owner = info.get("owner") or {}
         pub_ts = safe_int(info.get("pubdate") or info.get("ctime"), 0)
@@ -420,6 +448,15 @@ class BilibiliService:
         link = f"https://www.bilibili.com/video/{bvid}"
         if page_index > 0:
             link += f"?p={page_index + 1}"
+
+        video_path: Optional[Path] = None
+        if bool(self.content_config_getter().get("send_direct_video", True)):
+            try:
+                video_path = await self._prepare_video_file(video, bvid, page_index)
+            except MediaSizeLimitError as err:
+                logger.warning(f"BilibiliPush: 视频过大，回退为图文卡片: {err}")
+            except Exception as err:
+                logger.warning(f"BilibiliPush: 生成视频文件失败，回退为图文卡片: {err}")
 
         return VideoCard(
             aid=aid,
@@ -440,36 +477,158 @@ class BilibiliService:
             share=safe_int(stat.get("share"), 0),
             tname=str(info.get("tname") or ""),
             part_title=part_title,
-            direct_video_url=direct_video_url,
+            video_path=video_path,
         )
 
-    async def _extract_direct_video_url(self, video: Video, page_index: int) -> Optional[str]:
-        try:
-            config = self.content_config_getter() or {}
-            quality_name = str(config.get("video_quality", "_720P")).upper()
-            codec_name = str(config.get("video_codecs", "AVC")).upper()
-            quality = getattr(VideoQuality, quality_name, VideoQuality._720P)
-            codecs = getattr(VideoCodecs, codec_name, VideoCodecs.AVC)
-            download_url_data = await video.get_download_url(page_index=page_index)
-            detecter = VideoDownloadURLDataDetecter(download_url_data)
-            streams = detecter.detect_best_streams(
-                video_max_quality=quality,
-                codecs=[codecs],
-                no_dolby_video=True,
-                no_hdr=True,
+    async def _prepare_video_file(self, video: Video, bvid: str, page_index: int) -> Path:
+        runtime_config = self.runtime_config_getter() or {}
+        content_config = self.content_config_getter() or {}
+
+        max_size_mb = safe_int(
+            runtime_config.get("video_max_size_mb", DEFAULT_VIDEO_MAX_SIZE_MB),
+            DEFAULT_VIDEO_MAX_SIZE_MB,
+            minimum=10,
+            maximum=2048,
+        )
+        timeout_seconds = safe_int(
+            runtime_config.get(
+                "video_download_timeout",
+                DEFAULT_VIDEO_DOWNLOAD_TIMEOUT_SECONDS,
+            ),
+            DEFAULT_VIDEO_DOWNLOAD_TIMEOUT_SECONDS,
+            minimum=20,
+            maximum=3600,
+        )
+        max_bytes = max_size_mb * 1024 * 1024
+
+        quality_name = str(content_config.get("video_quality", "_720P")).upper()
+        codec_name = str(content_config.get("video_codecs", "AVC")).upper()
+        quality = getattr(VideoQuality, quality_name, VideoQuality._720P)
+        codecs = getattr(VideoCodecs, codec_name, VideoCodecs.AVC)
+
+        download_url_data = await video.get_download_url(page_index=page_index)
+        detecter = VideoDownloadURLDataDetecter(download_url_data)
+        streams = detecter.detect_best_streams(
+            video_max_quality=quality,
+            codecs=[codecs],
+            no_dolby_video=True,
+            no_hdr=True,
+        )
+        if not streams:
+            raise MediaDownloadError("未找到可下载的视频流")
+
+        video_stream = streams[0]
+        if not isinstance(video_stream, VideoStreamDownloadURL):
+            raise MediaDownloadError("视频流解析失败")
+
+        audio_stream = streams[1] if len(streams) > 1 else None
+        audio_url = audio_stream.url if isinstance(audio_stream, AudioStreamDownloadURL) else None
+
+        safe_quality = re.sub(r"[^A-Za-z0-9_]+", "_", quality_name)
+        safe_codec = re.sub(r"[^A-Za-z0-9_]+", "_", codec_name)
+        stem = f"{bvid}-p{page_index + 1}-{safe_quality}-{safe_codec}"
+        output_path = self.cache_dir / f"{stem}.mp4"
+        if output_path.exists() and output_path.stat().st_size > 0:
+            if output_path.stat().st_size > max_bytes:
+                await safe_unlink(output_path)
+                raise MediaSizeLimitError(f"缓存视频文件超过 {max_size_mb} MB 限制")
+            return output_path
+
+        headers = await self._build_media_headers()
+        if audio_url:
+            video_temp = self.cache_dir / f"{stem}.video{suffix_from_url(video_stream.url, '.m4s')}"
+            audio_temp = self.cache_dir / f"{stem}.audio{suffix_from_url(audio_url, '.m4s')}"
+            try:
+                await asyncio.gather(
+                    self._download_stream(video_stream.url, video_temp, headers, timeout_seconds, max_bytes),
+                    self._download_stream(audio_url, audio_temp, headers, timeout_seconds, max_bytes),
+                )
+                if video_temp.stat().st_size + audio_temp.stat().st_size > max_bytes:
+                    raise MediaSizeLimitError(
+                        f"预计合并后文件超过 {max_size_mb} MB 限制"
+                    )
+                await merge_av(video_temp, audio_temp, output_path)
+            except Exception:
+                await safe_unlink(video_temp)
+                await safe_unlink(audio_temp)
+                await safe_unlink(output_path)
+                raise
+        else:
+            await self._download_stream(
+                video_stream.url,
+                output_path,
+                headers,
+                timeout_seconds,
+                max_bytes,
             )
-            if not streams:
-                return None
-            video_stream = streams[0]
-            if not isinstance(video_stream, VideoStreamDownloadURL):
-                return None
-            audio_stream = streams[1] if len(streams) > 1 else None
-            if isinstance(audio_stream, AudioStreamDownloadURL):
-                return None
-            return video_stream.url
-        except Exception as err:
-            logger.warning(f"BilibiliPush: 提取直链视频失败，将回退为图文卡片: {err}")
-            return None
+
+        if output_path.stat().st_size > max_bytes:
+            await safe_unlink(output_path)
+            raise MediaSizeLimitError(f"视频文件超过 {max_size_mb} MB 限制")
+
+        return output_path
+
+    async def _build_media_headers(self) -> Dict[str, str]:
+        headers = dict(self.default_headers)
+        credential = await self.credential_manager.get_credential()
+        if credential is not None:
+            cookie = "; ".join(
+                f"{key}={value}"
+                for key, value in credential.get_cookies().items()
+                if value
+            )
+            if cookie:
+                headers["Cookie"] = cookie
+        return headers
+
+    async def _download_stream(
+        self,
+        url: str,
+        output_path: Path,
+        headers: Dict[str, str],
+        timeout_seconds: int,
+        max_bytes: int,
+    ) -> Path:
+        if output_path.exists() and output_path.stat().st_size > 0:
+            if output_path.stat().st_size > max_bytes:
+                await safe_unlink(output_path)
+                raise MediaSizeLimitError("缓存流文件超过大小限制")
+            return output_path
+
+        temp_path = output_path.with_suffix(output_path.suffix + ".part")
+        await safe_unlink(temp_path)
+
+        try:
+            async with self.client.stream(
+                "GET",
+                url,
+                headers=headers,
+                timeout=timeout_seconds,
+                follow_redirects=True,
+            ) as response:
+                response.raise_for_status()
+                content_length = safe_int(response.headers.get("content-length"), 0)
+                if content_length and content_length > max_bytes:
+                    raise MediaSizeLimitError("下载源文件超过大小限制")
+
+                written = 0
+                with open(temp_path, "wb") as file_obj:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise MediaSizeLimitError("下载过程中超过大小限制")
+                        file_obj.write(chunk)
+
+                if written <= 0:
+                    raise MediaDownloadError("下载结果为空文件")
+
+            temp_path.replace(output_path)
+            return output_path
+        except Exception:
+            await safe_unlink(temp_path)
+            raise
 
 
 class LinkResolver:
@@ -481,47 +640,57 @@ class LinkResolver:
         messages: Sequence[Any],
         text: str,
     ) -> Optional[ParseTarget]:
-        candidate = self._extract_candidate(messages, text)
+        candidate, source_kind = self._extract_candidate(messages, text)
         if not candidate:
             return None
-        return await self._normalize_candidate(candidate)
+        return await self._normalize_candidate(candidate, source_kind)
 
-    def _extract_candidate(self, messages: Sequence[Any], text: str) -> Optional[str]:
-        direct = self._extract_from_text(text)
+    def _extract_candidate(
+        self,
+        messages: Sequence[Any],
+        text: str,
+    ) -> Tuple[Optional[str], str]:
+        direct, source_kind = self._extract_from_text(text)
         if direct:
-            return direct
+            return direct, source_kind
 
         for component in messages:
             if isinstance(component, Json):
                 card_url = extract_json_url(component.data)
                 if card_url:
-                    return card_url
+                    return card_url, "card"
                 candidate = self._extract_from_json(component.data)
                 if candidate:
-                    return candidate
-        return None
+                    return candidate, "card"
 
-    def _extract_from_text(self, text: str) -> Optional[str]:
+        return None, "code"
+
+    def _extract_from_text(self, text: str) -> Tuple[Optional[str], str]:
         if not text:
-            return None
+            return None, "code"
         stripped = text.strip()
         if stripped.startswith("/"):
-            return None
+            return None, "code"
         if match := URL_PATTERN.search(stripped):
-            return strip_trailing_punctuation(match.group("url"))
+            return strip_trailing_punctuation(match.group("url")), "link"
         if match := BV_PATTERN.search(stripped):
-            return match.group("bvid")
+            return match.group("bvid"), "code"
         if match := AV_PATTERN.search(stripped):
-            return match.group("avid")
-        return None
+            return match.group("avid"), "code"
+        return None, "code"
 
     def _extract_from_json(self, payload: Any) -> Optional[str]:
         for value in iter_string_values(payload):
-            if candidate := self._extract_from_text(value):
+            candidate, _ = self._extract_from_text(value)
+            if candidate:
                 return candidate
         return None
 
-    async def _normalize_candidate(self, candidate: str) -> Optional[ParseTarget]:
+    async def _normalize_candidate(
+        self,
+        candidate: str,
+        source_kind: str,
+    ) -> Optional[ParseTarget]:
         cleaned = strip_trailing_punctuation(candidate)
         if SHORT_URL_PATTERN.search(cleaned):
             try:
@@ -532,20 +701,43 @@ class LinkResolver:
 
         if match := BV_PATTERN.search(cleaned):
             page_num = extract_page_num(cleaned)
-            return ParseTarget(bvid=match.group("bvid"), page_num=page_num, raw_input=candidate)
+            return ParseTarget(
+                bvid=match.group("bvid"),
+                page_num=page_num,
+                raw_input=candidate,
+                source_kind=source_kind,
+            )
 
         if match := VIDEO_BV_URL_PATTERN.search(cleaned):
             page_num = extract_page_num(cleaned)
-            return ParseTarget(bvid=match.group("bvid"), page_num=page_num, raw_input=candidate)
+            return ParseTarget(
+                bvid=match.group("bvid"),
+                page_num=page_num,
+                raw_input=candidate,
+                source_kind=source_kind,
+            )
 
         if match := BILIBILI_SCHEME_AV_PATTERN.search(cleaned):
-            return ParseTarget(aid=safe_int(match.group("avid"), 0), raw_input=candidate)
+            return ParseTarget(
+                aid=safe_int(match.group("avid"), 0),
+                raw_input=candidate,
+                source_kind=source_kind,
+            )
 
         if match := VIDEO_AV_URL_PATTERN.search(cleaned):
-            return ParseTarget(aid=safe_int(match.group("avid").lstrip("avAV"), 0), page_num=extract_page_num(cleaned), raw_input=candidate)
+            return ParseTarget(
+                aid=safe_int(match.group("avid").lstrip("avAV"), 0),
+                page_num=extract_page_num(cleaned),
+                raw_input=candidate,
+                source_kind=source_kind,
+            )
 
         if match := AV_PATTERN.search(cleaned):
-            return ParseTarget(aid=safe_int(match.group("avid").lstrip("avAV"), 0), raw_input=candidate)
+            return ParseTarget(
+                aid=safe_int(match.group("avid").lstrip("avAV"), 0),
+                raw_input=candidate,
+                source_kind=source_kind,
+            )
 
         return None
 
@@ -563,6 +755,8 @@ class Main(Star):
         self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.data_dir / "monitor_state.json"
+        self.media_cache_dir = self.data_dir / "media_cache"
+        self.media_cache_dir.mkdir(parents=True, exist_ok=True)
         self._state = self._load_state()
 
         transport = httpx.AsyncHTTPTransport(retries=2)
@@ -589,6 +783,8 @@ class Main(Star):
             client=self.client,
             credential_manager=self.credential_manager,
             content_config_getter=lambda: self.content_config,
+            runtime_config_getter=lambda: self.runtime_config,
+            cache_dir=self.media_cache_dir,
         )
         self.link_resolver = LinkResolver(self.service)
         self.debouncer = DebounceCache(self.debounce_seconds)
@@ -596,6 +792,10 @@ class Main(Star):
     @property
     def auth_config(self) -> Dict[str, Any]:
         return self.config.get("auth_settings", {}) or {}
+
+    @property
+    def passive_config(self) -> Dict[str, Any]:
+        return self.config.get("passive_settings", {}) or {}
 
     @property
     def monitoring_config(self) -> Dict[str, Any]:
@@ -672,10 +872,6 @@ class Main(Star):
     def _state_get(self, key: str, default: Any = None) -> Any:
         return self._state.get(key, default)
 
-    def _state_set(self, key: str, value: Any) -> None:
-        self._state[key] = value
-        self._save_state()
-
     def _state_update(self, values: Dict[str, Any]) -> None:
         self._state.update(values)
         self._save_state()
@@ -695,6 +891,11 @@ class Main(Star):
                 if value:
                     values.append(value)
         return list(dict.fromkeys(values))
+
+    def _parse_string_list(self, raw: Any) -> List[str]:
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        return self._parse_multi_value(raw)
 
     def _pick_interval(self, base: int, jitter: int, minimum: int = 1) -> int:
         if jitter <= 0:
@@ -716,6 +917,39 @@ class Main(Star):
         if not owner_id:
             return True
         return str(event.get_sender_id()) == owner_id
+
+    def _save_plugin_config(self) -> None:
+        if hasattr(self.config, "save_config"):
+            try:
+                self.config.save_config()
+            except Exception as err:
+                logger.error(f"BilibiliPush: 保存插件配置失败: {err}")
+
+    def _ensure_passive_blacklist(self) -> List[str]:
+        passive_settings = self.config.setdefault("passive_settings", {})
+        blacklist = passive_settings.setdefault("session_blacklist", [])
+        if not isinstance(blacklist, list):
+            blacklist = []
+            passive_settings["session_blacklist"] = blacklist
+        return blacklist
+
+    def _ensure_passive_whitelist(self) -> List[str]:
+        passive_settings = self.config.setdefault("passive_settings", {})
+        whitelist = passive_settings.setdefault("session_whitelist", [])
+        if not isinstance(whitelist, list):
+            whitelist = []
+            passive_settings["session_whitelist"] = whitelist
+        return whitelist
+
+    def _is_passive_session_allowed(self, event: AstrMessageEvent) -> bool:
+        whitelist = self._parse_string_list(self.passive_config.get("session_whitelist", []))
+        blacklist = self._parse_string_list(self.passive_config.get("session_blacklist", []))
+        umo = event.unified_msg_origin
+        if whitelist and umo not in whitelist:
+            return False
+        if blacklist and umo in blacklist:
+            return False
+        return True
 
     def _resolve_monitor_rules(self) -> List[MonitorRule]:
         raw_rules = self.monitoring_config.get("subscription_rules", []) or []
@@ -774,20 +1008,41 @@ class Main(Star):
         template = self.push_template if push else self.parse_template
         return template.format_map(payload)
 
-    def _build_message_chain(self, card: VideoCard, *, push: bool) -> MessageChain:
-        chain = MessageChain().message(self._render_video_text(card, push=push))
-        if bool(self.content_config.get("send_cover", True)) and card.cover_url:
+    def _should_add_qq_face(self, event: AstrMessageEvent, target: ParseTarget) -> bool:
+        return (
+            bool(self.passive_config.get("qq_link_emoji_enabled", True))
+            and event.get_platform_id() == "aiocqhttp"
+            and target.source_kind in {"link", "card"}
+        )
+
+    def _build_message_chain(
+        self,
+        card: VideoCard,
+        *,
+        push: bool,
+        event: Optional[AstrMessageEvent] = None,
+        target: Optional[ParseTarget] = None,
+    ) -> MessageChain:
+        chain = MessageChain()
+        if event is not None and target is not None and self._should_add_qq_face(event, target):
+            chain.chain.append(Face(id=QQ_ZAN_FACE_ID))
+            chain.chain.append(Plain(" "))
+
+        chain.message(self._render_video_text(card, push=push))
+
+        if card.video_path is not None:
+            chain.chain.append(MessageVideo.fromFileSystem(str(card.video_path)))
+        elif bool(self.content_config.get("send_cover", True)) and card.cover_url:
             chain.url_image(card.cover_url)
-        if bool(self.content_config.get("send_direct_video", False)) and card.direct_video_url:
-            chain.chain.append(MessageVideo.fromURL(card.direct_video_url))
+
         return chain
 
     async def _send_card_to_targets(self, card: VideoCard, targets: Sequence[str]) -> Dict[str, int]:
         success = 0
         failure = 0
-        chain = self._build_message_chain(card, push=True)
         for target in targets:
             try:
+                chain = self._build_message_chain(card, push=True)
                 sent = await self.context.send_message(target, chain)
                 if sent:
                     success += 1
@@ -834,23 +1089,11 @@ class Main(Star):
         new_items.reverse()
         return new_items
 
-    async def _push_recent_video_to_current_session(
-        self, event: AstrMessageEvent, source: str
-    ) -> Tuple[bool, str]:
-        uid = self.service.resolve_uid(source)
-        if uid is None:
-            return False, "无法从输入中解析出 UP 主 UID。"
-        recent = await self._check_uid_videos(uid, force_fetch=True)
-        if not recent:
-            return False, f"UID {uid} 最近没有获取到视频。"
-        card = await self.service.fetch_video_card(ParseTarget(bvid=recent[0].bvid))
-        yield_chain = self._build_message_chain(card, push=True)
-        await self.context.send_message(event.unified_msg_origin, yield_chain)
-        return True, f"已向当前会话发送 UID {uid} 的最新视频。"
-
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         if not bool(self.content_config.get("auto_parse_enabled", True)):
+            return
+        if not self._is_passive_session_allowed(event):
             return
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return
@@ -876,7 +1119,7 @@ class Main(Star):
             if self.debouncer.hit_resource(event.unified_msg_origin, card.bvid or str(card.aid)):
                 return
 
-            chain = self._build_message_chain(card, push=False)
+            chain = self._build_message_chain(card, push=False, event=event, target=target)
             yield event.chain_result(chain.chain)
         except asyncio.CancelledError:
             raise
@@ -909,6 +1152,29 @@ class Main(Star):
             return
         await self.credential_manager.clear()
         yield event.plain_result("✅ 已清除本地持久化的 Bilibili 登录态。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_parse_on", alias={"开启B站解析", "开启b站解析"})
+    async def bili_parse_on(self, event: AstrMessageEvent):
+        blacklist = self._ensure_passive_blacklist()
+        whitelist = self._ensure_passive_whitelist()
+        umo = event.unified_msg_origin
+        if umo in blacklist:
+            blacklist.remove(umo)
+        if whitelist and umo not in whitelist:
+            whitelist.append(umo)
+        self._save_plugin_config()
+        yield event.plain_result("✅ 已开启当前会话的 B 站被动解析。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_parse_off", alias={"关闭B站解析", "关闭b站解析"})
+    async def bili_parse_off(self, event: AstrMessageEvent):
+        blacklist = self._ensure_passive_blacklist()
+        umo = event.unified_msg_origin
+        if umo not in blacklist:
+            blacklist.append(umo)
+        self._save_plugin_config()
+        yield event.plain_result("✅ 已关闭当前会话的 B 站被动解析。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_check")
@@ -1182,3 +1448,49 @@ def format_count(value: int) -> str:
     if value >= 10000:
         return f"{value / 10000:.1f}万"
     return str(value)
+
+
+def suffix_from_url(url: str, default: str) -> str:
+    suffix = Path(urlparse(url).path).suffix
+    return suffix if suffix else default
+
+
+async def safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+async def merge_av(v_path: Path, a_path: Path, output_path: Path) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(v_path),
+        "-i",
+        str(a_path),
+        "-c",
+        "copy",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        str(output_path),
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as err:
+        raise MediaDownloadError("未安装 ffmpeg，无法合并 B 站音视频") from err
+
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        error_message = stderr.decode("utf-8", errors="ignore").strip()
+        raise MediaDownloadError(f"ffmpeg 合并失败: {error_message}")
+
+    await safe_unlink(v_path)
+    await safe_unlink(a_path)
