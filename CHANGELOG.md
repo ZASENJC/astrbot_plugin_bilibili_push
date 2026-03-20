@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.2 - 2026-03-21
+
+### Fixed
+- 为 `ffmpeg` 音视频合并增加超时控制与超时后进程终止，避免异常流导致协程长期阻塞。
+- 为 `extract_json_url` 与 QQ 表情附加中的宽泛异常补充 `logger.debug` 日志，便于定位解析失败原因。
+- 为 `/bili_parse_on`、`/bili_parse_off` 增加“无 `save_config()` 环境”的 state 文件持久化兜底，避免会话黑白名单仅存内存。
+
+### Changed
+- 按 Python 3.10+ 写法将主要类型注解从 `typing.List/Dict/Tuple/Optional` 迁移为内建泛型与 `| None`。
+- 依据官方插件配置文档保留 `AstrBotConfig.save_config()` 作为优先配置持久化路径，并在不支持时自动回退。
+
 ## v0.4.1 - 2026-03-19
 
 ### Fixed
