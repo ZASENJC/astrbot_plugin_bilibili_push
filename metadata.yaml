@@ -1,7 +1,7 @@
 name: astrbot_plugin_bilibili_push
-display_name: B站解析推送助手
-desc: 一个简洁的 Bilibili 视频被动解析与订阅推送插件，支持扫码登录持久化 Cookie、视频/图文双发送策略。
-version: v0.4.2
+display_name: B站/A站解析推送助手
+desc: 一个 Bilibili 与 AcFun 视频被动解析与订阅推送插件，支持扫码登录持久化 Cookie、视频/图文双发送策略。
+version: v1.0.0
 author: ZASENJC
 repo: https://github.com/ZASENJC/astrbot_plugin_bilibili_push
 astrbot_version: ">=4.10.4,<5"

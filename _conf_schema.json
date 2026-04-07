@@ -149,8 +149,8 @@
   },
   "runtime_settings": {
     "type": "object",
-    "description": "运行参数",
-    "hint": "控制轮询频率、请求间隔、下载超时和被动解析防抖。",
+    "description": "运行参数（B站与AcFun共用）",
+    "hint": "控制轮询频率、请求间隔、下载超时和被动解析防抖。B站与AcFun共用此配置。",
     "items": {
       "check_interval": {
         "type": "int",
@@ -188,6 +188,128 @@
         "default": 300,
         "description": "视频下载超时（秒）",
         "hint": "用于视频下载阶段。"
+      }
+    }
+  },
+  "acfun_passive_settings": {
+    "type": "object",
+    "description": "AcFun 被动解析设置",
+    "hint": "控制哪些会话会自动识别和解析 AcFun 链接和 ac 号。",
+    "items": {
+      "acfun_auto_parse_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "启用 AcFun 被动自动解析",
+        "hint": "关闭后不会自动识别聊天里的 AcFun 内容。"
+      },
+      "acfun_session_whitelist": {
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "允许解析的会话白名单（AcFun）",
+        "hint": "留空表示不限制；填写后仅这些会话会触发 AcFun 解析。会话 ID 可用 /sid 获取。"
+      },
+      "acfun_session_blacklist": {
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "禁止解析的会话黑名单（AcFun）",
+        "hint": "这些会话不会触发 AcFun 解析，也可配合 /acfun_parse_on 和 /acfun_parse_off 使用。"
+      },
+      "acfun_qq_link_emoji_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "给原消息附加随机默认表情（AcFun）",
+        "hint": "识别到 AcFun 链接时，尝试给触发解析的原消息附加表情。仅 aiocqhttp 生效。"
+      }
+    }
+  },
+  "acfun_monitoring_settings": {
+    "type": "object",
+    "description": "AcFun 主动监控规则",
+    "hint": "配置需要轮询的 AcFun UP 主，以及接收主动推送的会话。",
+    "items": {
+      "acfun_subscription_rules": {
+        "type": "template_list",
+        "default": [],
+        "description": "AcFun UP 主监控列表",
+        "templates": {
+          "acfun_subscription_rule": {
+            "name": "AcFun 主动监控",
+            "hint": "source 支持 UID 或个人主页链接；allowed_targets 支持逗号或换行分隔多个会话。",
+            "items": {
+              "source": {
+                "type": "text",
+                "default": "",
+                "description": "UP 主 UID / 个人主页链接（可多个）",
+                "hint": "例如：12345678, https://www.acfun.cn/u/12345678"
+              },
+              "allowed_targets": {
+                "type": "text",
+                "default": "",
+                "description": "接收推送的会话 ID",
+                "hint": "例如：aiocqhttp:GroupMessage:123456789。支持英文逗号或换行分隔多个。"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "acfun_content_settings": {
+    "type": "object",
+    "description": "AcFun 推送与解析内容",
+    "hint": "控制 AcFun 视频发送、图文发送和图文模板。",
+    "items": {
+      "acfun_send_direct_video": {
+        "type": "bool",
+        "default": true,
+        "description": "优先发送视频（AcFun）",
+        "hint": "开启后会尝试下载并发送视频；若视频不可用，会自动回退为图文。"
+      },
+      "acfun_send_rich_text": {
+        "type": "bool",
+        "default": false,
+        "description": "同时发送图文（AcFun）",
+        "hint": "开启后会在视频之外再发送图文；关闭后默认只发视频。若视频关闭或视频不可用，也会自动发送图文。"
+      },
+      "acfun_send_cover": {
+        "type": "bool",
+        "default": true,
+        "description": "图文消息附带封面图（AcFun）"
+      },
+      "acfun_video_max_duration_minutes": {
+        "type": "int",
+        "default": 30,
+        "description": "视频发送时长上限（分钟，AcFun）",
+        "hint": "超过这个时长时强制改为发送图文；填 0 表示不限制。"
+      },
+      "acfun_video_max_size_mb": {
+        "type": "int",
+        "default": 90,
+        "description": "视频发送大小上限（MB，AcFun）",
+        "hint": "超过上限时强制改为发送图文。"
+      },
+      "acfun_description_length": {
+        "type": "int",
+        "default": 120,
+        "description": "图文简介截断长度（AcFun）"
+      },
+      "acfun_parse_message_format": {
+        "type": "text",
+        "default": "📺 {title}\\nUP: {up_name}\\n时长: {duration}\\n发布时间: {pub_time}\\n播放: {view}  点赞: {like}  弹幕: {danmaku}  香蕉: {banana}\\n简介: {desc}\\n链接: {link}",
+        "description": "图文回复模板（AcFun）",
+        "hint": "支持变量：{title} {up_name} {duration} {pub_time} {view} {like} {danmaku} {banana} {stow} {comment} {share} {desc} {link} {acid} {channel}"
+      },
+      "acfun_push_message_format": {
+        "type": "text",
+        "default": "🔔 {up_name} 投稿了新视频\\n\\n{title}\\n时长: {duration}\\n发布时间: {pub_time}\\n播放: {view}  点赞: {like}\\n简介: {desc}\\n链接: {link}",
+        "description": "主动推送图文模板（AcFun）",
+        "hint": "支持与上方相同的变量。"
       }
     }
   }

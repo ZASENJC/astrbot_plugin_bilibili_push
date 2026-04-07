@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.0.0 - 2026-04-08
+
+### Added
+
+- 新增 AcFun（A站）视频被动自动解析：识别 `acfun.cn` 链接、移动端链接、QQ 分享卡片、独立 `acXXX` 编号。
+- 新增 AcFun 主动订阅推送：按 UP 主 UID 或主页链接配置监控规则，定时推送新投稿。
+- 新增 AcFun 视频下载发送（通过页面提取 m3u8 → ffmpeg 转封装 MP4），不可用时自动回退图文。
+- 新增 AcFun 图文推送模板，支持 `{title}` `{up_name}` `{acid}` `{link}` `{duration}` `{pub_time}` `{view}` `{like}` `{danmaku}` `{banana}` `{stow}` `{comment}` `{share}` `{channel}` `{desc}` 等变量。
+- 新增 AcFun 独立被动解析会话控制（白名单、黑名单、`/acfun_parse_on`、`/acfun_parse_off`）。
+- 新增 `/acfun_check`、`/acfun_check_all` 手动触发 AcFun 监控检查。
+- 配置面板新增「AcFun 被动解析设置」「AcFun 主动监控规则」「AcFun 推送与解析内容」三个独立分组，与 B 站配置互不干扰。
+- 插件显示名变更为"B站/A站解析推送助手"。
+
+### Fixed
+
+- 修正 AcFun 短视频（< 100 秒）时长解析错误导致无法发送视频的问题。
+
+### Changed
+
+- 「运行参数」配置分组改为 B站与 AcFun 共用。
+
+### Unchanged
+
+- Bilibili 所有现有功能与指令完全不受影响，代码零修改。
+
 ## v0.4.2 - 2026-03-21
 
 ### Fixed

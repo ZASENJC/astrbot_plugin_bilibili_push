@@ -93,6 +93,39 @@ SPACE_UID_QUERY_PATTERN = re.compile(r"(?:uid|mid|vmid)=(?P<uid>\d+)", re.IGNORE
 BILIBILI_SCHEME_AV_PATTERN = re.compile(r"bilibili://video/av(?P<avid>\d+)", re.IGNORECASE)
 TRAILING_PUNCTUATION = "'\"）)]】}>，。！？；：,.!?;:"
 
+ACFUN_DEFAULT_PARSE_TEMPLATE = (
+    "📺 {title}\n"
+    "UP: {up_name}\n"
+    "时长: {duration}\n"
+    "发布时间: {pub_time}\n"
+    "播放: {view}  点赞: {like}  弹幕: {danmaku}  香蕉: {banana}\n"
+    "简介: {desc}\n"
+    "链接: {link}"
+)
+ACFUN_DEFAULT_PUSH_TEMPLATE = (
+    "🔔 {up_name} 投稿了新视频\n\n"
+    "{title}\n"
+    "时长: {duration}\n"
+    "发布时间: {pub_time}\n"
+    "播放: {view}  点赞: {like}\n"
+    "简介: {desc}\n"
+    "链接: {link}"
+)
+
+ACFUN_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.|m\.)?acfun\.cn/v/[\?]?ac(\d+)",
+    re.IGNORECASE,
+)
+ACFUN_USER_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.|m\.)?acfun\.cn/u/(\d+)",
+    re.IGNORECASE,
+)
+ACID_PATTERN = re.compile(r"\bac(\d{1,12})\b", re.IGNORECASE)
+ACFUN_VIDEOINFO_PATTERN = re.compile(
+    r"window\.videoInfo\s*=\s*", re.IGNORECASE
+)
+ACFUN_AJAXPIPE_TRAILING = re.compile(r"/\*.*?\*/$")
+ACFUN_HREF_ACID_PATTERN = re.compile(r'href="/v/(ac\d+)"', re.IGNORECASE)
 
 try:
     select_client("curl_cffi")
@@ -134,6 +167,55 @@ class ParseTarget:
     page_num: int = 1
     raw_input: str = ""
     source_kind: str = "code"
+
+
+@dataclass(frozen=True)
+class AcFunMonitorRule:
+    user_id: int
+    targets: tuple[str, ...]
+    source: str
+
+
+@dataclass
+class AcFunVideoItem:
+    acid: str
+    title: str
+    created_ts: int
+    author: str
+    cover_url: str = ""
+    desc: str = ""
+
+
+@dataclass
+class AcFunParseTarget:
+    acid: str
+    raw_input: str = ""
+    source_kind: str = "code"
+
+
+@dataclass
+class AcFunVideoCard:
+    acid: str
+    title: str
+    link: str
+    up_name: str
+    cover_url: str
+    desc: str
+    duration_seconds: int
+    pub_ts: int
+    view: int
+    like: int
+    danmaku: int
+    banana: int
+    stow: int
+    comment: int
+    share: int
+    channel: str = ""
+    video_path: Path | None = None
+
+    @property
+    def duration_text(self) -> str:
+        return format_duration(self.duration_seconds)
 
 
 @dataclass
@@ -784,8 +866,399 @@ class LinkResolver:
         return None
 
 
+class AcFunService:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        content_config_getter,
+        runtime_config_getter,
+        cache_dir: Path,
+    ) -> None:
+        self.client = client
+        self.content_config_getter = content_config_getter
+        self.runtime_config_getter = runtime_config_getter
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.default_headers = {
+            "Referer": "https://www.acfun.cn/",
+            "Origin": "https://www.acfun.cn",
+        }
+
+    def _video_push_requested(self) -> bool:
+        content_config = self.content_config_getter() or {}
+        return bool(content_config.get("acfun_send_direct_video", True))
+
+    def _video_duration_limit_seconds(self) -> int:
+        content_config = self.content_config_getter() or {}
+        limit_minutes = safe_int(
+            content_config.get(
+                "acfun_video_max_duration_minutes",
+                DEFAULT_VIDEO_MAX_DURATION_MINUTES,
+            ),
+            DEFAULT_VIDEO_MAX_DURATION_MINUTES,
+            minimum=0,
+            maximum=24 * 60,
+        )
+        if limit_minutes <= 0:
+            return 0
+        return limit_minutes * 60
+
+    def _should_attempt_video_download(self, duration_seconds: int) -> bool:
+        if not self._video_push_requested():
+            return False
+        limit_seconds = self._video_duration_limit_seconds()
+        if limit_seconds > 0 and duration_seconds > limit_seconds:
+            return False
+        return True
+
+    def resolve_user_id(self, source: str) -> int | None:
+        candidate = source.strip()
+        if not candidate:
+            return None
+        if candidate.isdigit():
+            return int(candidate)
+        if match := ACFUN_USER_URL_PATTERN.search(candidate):
+            return int(match.group(1))
+        return None
+
+    async def fetch_recent_videos(self, user_id: int, limit: int) -> list[AcFunVideoItem]:
+        page_size = max(1, min(limit, 30))
+        timestamp_ms = int(time.time() * 1000)
+        url = (
+            f"https://www.acfun.cn/u/{user_id}"
+            f"?quickViewId=ac-space-video-list&reqID=1&ajaxpipe=1"
+            f"&type=video&order=newest&page=1&pageSize={page_size}&t={timestamp_ms}"
+        )
+        response = await self.client.get(
+            url,
+            headers=self.default_headers,
+            follow_redirects=True,
+        )
+        raw_text = response.text
+        cleaned = ACFUN_AJAXPIPE_TRAILING.sub("", raw_text).strip()
+        if not cleaned:
+            return []
+
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as err:
+            logger.error(f"AcFunPush: 解析用户投稿列表 JSON 失败: {err}")
+            return []
+
+        html_content = ""
+        if isinstance(data, dict):
+            html_content = str(data.get("html") or "")
+        elif isinstance(data, str):
+            html_content = data
+
+        if not html_content:
+            return []
+
+        acids: list[str] = []
+        seen: set[str] = set()
+        for match in ACFUN_HREF_ACID_PATTERN.finditer(html_content):
+            acid = match.group(1)
+            if acid not in seen:
+                seen.add(acid)
+                acids.append(acid)
+
+        items: list[AcFunVideoItem] = []
+        for acid in acids[:page_size]:
+            try:
+                info = await self._extract_video_info(acid)
+                if info is None:
+                    continue
+                user_info = info.get("user") or {}
+                items.append(
+                    AcFunVideoItem(
+                        acid=acid,
+                        title=str(info.get("title") or "未命名视频"),
+                        created_ts=safe_int(
+                            info.get("createTimeMillis"), 0
+                        ) // 1000 or safe_int(info.get("createTime"), 0),
+                        author=str(user_info.get("name") or "未知UP"),
+                        cover_url=normalize_cover_url(info.get("coverUrl") or ""),
+                        desc=str(info.get("description") or ""),
+                    )
+                )
+            except Exception as err:
+                logger.debug(f"AcFunPush: 获取视频 {acid} 详情失败: {err}")
+                items.append(
+                    AcFunVideoItem(
+                        acid=acid,
+                        title="未知",
+                        created_ts=0,
+                        author="未知UP",
+                    )
+                )
+        return items
+
+    async def fetch_video_card(self, target: AcFunParseTarget) -> AcFunVideoCard:
+        info = await self._extract_video_info(target.acid)
+        if info is None:
+            raise ValueError(f"无法获取 AcFun 视频 ac{target.acid} 的信息")
+
+        title = str(info.get("title") or "未命名视频")
+        user_info = info.get("user") or {}
+        up_name = str(user_info.get("name") or "未知UP")
+        duration_ms = safe_int(info.get("durationMillis"), 0)
+        if duration_ms <= 0:
+            duration_ms = safe_int(info.get("duration"), 0)
+        duration_seconds = duration_ms // 1000 if duration_ms > 0 else 0
+        pub_ts = (
+            safe_int(info.get("createTimeMillis"), 0) // 1000
+            or safe_int(info.get("createTime"), 0)
+        )
+
+        acid = str(info.get("id") or target.acid)
+        link = f"https://www.acfun.cn/v/ac{acid}"
+
+        video_path: Path | None = None
+        if self._should_attempt_video_download(duration_seconds):
+            try:
+                m3u8_url = self._extract_m3u8_url(info)
+                if m3u8_url:
+                    video_path = await self._prepare_video_file(acid, m3u8_url)
+            except MediaSizeLimitError as err:
+                logger.warning(f"AcFunPush: 视频过大，回退为图文卡片: {err}")
+            except Exception as err:
+                logger.warning(f"AcFunPush: 生成视频文件失败，回退为图文卡片: {err}")
+
+        return AcFunVideoCard(
+            acid=acid,
+            title=title,
+            link=link,
+            up_name=up_name,
+            cover_url=normalize_cover_url(info.get("coverUrl") or ""),
+            desc=str(info.get("description") or ""),
+            duration_seconds=duration_seconds,
+            pub_ts=pub_ts,
+            view=safe_int(info.get("viewCount"), 0),
+            like=safe_int(info.get("likeCount"), 0),
+            danmaku=safe_int(info.get("danmakuCount"), 0),
+            banana=safe_int(info.get("bananaCount"), 0),
+            stow=safe_int(info.get("stowCount"), 0),
+            comment=safe_int(info.get("commentCount"), 0),
+            share=safe_int(info.get("shareCount"), 0),
+            channel=str(info.get("channel") or "").strip(),
+            video_path=video_path,
+        )
+
+    async def _extract_video_info(self, acid: str) -> dict | None:
+        url = f"https://www.acfun.cn/v/ac{acid}"
+        response = await self.client.get(
+            url,
+            headers=self.default_headers,
+            follow_redirects=True,
+        )
+        html = response.text
+
+        match = ACFUN_VIDEOINFO_PATTERN.search(html)
+        if not match:
+            logger.debug(f"AcFunPush: 页面中未找到 window.videoInfo (ac{acid})")
+            return None
+
+        start = match.end()
+        json_str = _extract_json_object(html, start)
+        if not json_str:
+            logger.debug(f"AcFunPush: 提取 videoInfo JSON 失败 (ac{acid})")
+            return None
+
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as err:
+            logger.error(f"AcFunPush: 解析 videoInfo JSON 失败 (ac{acid}): {err}")
+            return None
+
+    def _extract_m3u8_url(self, info: dict) -> str | None:
+        current = info.get("currentVideoInfo") or {}
+        ks_play_str = current.get("ksPlayJson") or ""
+        if not ks_play_str:
+            return None
+        try:
+            ks_play = json.loads(ks_play_str)
+        except json.JSONDecodeError as err:
+            logger.error(f"AcFunPush: 解析 ksPlayJson 失败: {err}")
+            return None
+
+        adaptation_set = ks_play.get("adaptationSet") or []
+        if not adaptation_set:
+            return None
+
+        representations = adaptation_set[0].get("representation") or []
+        if not representations:
+            return None
+
+        best = representations[0]
+        for rep in representations:
+            url = rep.get("url") or ""
+            if url:
+                best = rep
+                break
+
+        return best.get("url")
+
+    async def _prepare_video_file(self, acid: str, m3u8_url: str) -> Path:
+        runtime_config = self.runtime_config_getter() or {}
+        content_config = self.content_config_getter() or {}
+
+        max_size_mb = safe_int(
+            content_config.get(
+                "acfun_video_max_size_mb",
+                runtime_config.get("video_max_size_mb", DEFAULT_VIDEO_MAX_SIZE_MB),
+            ),
+            DEFAULT_VIDEO_MAX_SIZE_MB,
+            minimum=10,
+            maximum=2048,
+        )
+        timeout_seconds = safe_int(
+            runtime_config.get(
+                "video_download_timeout",
+                DEFAULT_VIDEO_DOWNLOAD_TIMEOUT_SECONDS,
+            ),
+            DEFAULT_VIDEO_DOWNLOAD_TIMEOUT_SECONDS,
+            minimum=20,
+            maximum=3600,
+        )
+
+        output_path = self.cache_dir / f"ac{acid}.mp4"
+        if output_path.exists() and output_path.stat().st_size > 0:
+            max_bytes = max_size_mb * 1024 * 1024
+            if output_path.stat().st_size > max_bytes:
+                await safe_unlink(output_path)
+                raise MediaSizeLimitError(f"缓存视频文件超过 {max_size_mb} MB 限制")
+            return output_path
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-headers",
+            f"Referer: {self.default_headers['Referer']}\r\n",
+            "-i",
+            m3u8_url,
+            "-c",
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
+            str(output_path),
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as err:
+            raise MediaDownloadError("未安装 ffmpeg，无法下载 AcFun 视频") from err
+
+        try:
+            _, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError as err:
+            process.kill()
+            await process.wait()
+            raise MediaDownloadError(
+                f"ffmpeg 下载 AcFun 视频超时（{timeout_seconds} 秒）"
+            ) from err
+
+        if process.returncode != 0:
+            error_message = stderr.decode("utf-8", errors="ignore").strip()
+            await safe_unlink(output_path)
+            raise MediaDownloadError(f"ffmpeg 下载 AcFun 视频失败: {error_message}")
+
+        if not output_path.exists() or output_path.stat().st_size <= 0:
+            await safe_unlink(output_path)
+            raise MediaDownloadError("ffmpeg 输出文件为空")
+
+        max_bytes = max_size_mb * 1024 * 1024
+        if output_path.stat().st_size > max_bytes:
+            await safe_unlink(output_path)
+            raise MediaSizeLimitError(f"视频文件超过 {max_size_mb} MB 限制")
+
+        return output_path
+
+
+class AcFunLinkResolver:
+    def __init__(self, service: AcFunService) -> None:
+        self.service = service
+
+    async def extract_parse_target(
+        self,
+        messages: Sequence[Any],
+        text: str,
+    ) -> AcFunParseTarget | None:
+        candidate, source_kind = self._extract_candidate(messages, text)
+        if not candidate:
+            return None
+        return self._normalize_candidate(candidate, source_kind)
+
+    def _extract_candidate(
+        self,
+        messages: Sequence[Any],
+        text: str,
+    ) -> tuple[str | None, str]:
+        direct, source_kind = self._extract_from_text(text)
+        if direct:
+            return direct, source_kind
+
+        for component in messages:
+            if isinstance(component, Json):
+                card_url = extract_acfun_json_url(component.data)
+                if card_url:
+                    return card_url, "card"
+                candidate = self._extract_from_json(component.data)
+                if candidate:
+                    return candidate, "card"
+
+        return None, "code"
+
+    def _extract_from_text(self, text: str) -> tuple[str | None, str]:
+        if not text:
+            return None, "code"
+        stripped = text.strip()
+        if stripped.startswith("/"):
+            return None, "code"
+        if match := ACFUN_URL_PATTERN.search(stripped):
+            return strip_trailing_punctuation(match.group(0)), "link"
+        if match := ACID_PATTERN.search(stripped):
+            return match.group(0), "code"
+        return None, "code"
+
+    def _extract_from_json(self, payload: Any) -> str | None:
+        for value in iter_string_values(payload):
+            candidate, _ = self._extract_from_text(value)
+            if candidate:
+                return candidate
+        return None
+
+    def _normalize_candidate(
+        self,
+        candidate: str,
+        source_kind: str,
+    ) -> AcFunParseTarget | None:
+        cleaned = strip_trailing_punctuation(candidate)
+
+        if match := ACFUN_URL_PATTERN.search(cleaned):
+            return AcFunParseTarget(
+                acid=match.group(1),
+                raw_input=candidate,
+                source_kind=source_kind,
+            )
+
+        if match := ACID_PATTERN.search(cleaned):
+            acid_digits = match.group(1)
+            return AcFunParseTarget(
+                acid=acid_digits,
+                raw_input=candidate,
+                source_kind=source_kind,
+            )
+
+        return None
+
+
 class Main(Star):
-    """B 站视频自动解析与订阅推送插件。"""
+    """B 站与 AcFun 视频自动解析与订阅推送插件。"""
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
@@ -831,6 +1304,17 @@ class Main(Star):
         )
         self.link_resolver = LinkResolver(self.service)
         self.debouncer = DebounceCache(self.debounce_seconds)
+
+        self.acfun_service = AcFunService(
+            client=self.client,
+            content_config_getter=lambda: self.acfun_content_config,
+            runtime_config_getter=lambda: self.runtime_config,
+            cache_dir=self.media_cache_dir,
+        )
+        self.acfun_link_resolver = AcFunLinkResolver(self.acfun_service)
+        self.acfun_debouncer = DebounceCache(self.debounce_seconds)
+        self.acfun_monitor_task: asyncio.Task | None = None
+        self.acfun_session_initialized_uids: set[int] = set()
 
     @property
     def auth_config(self) -> dict[str, Any]:
@@ -880,6 +1364,42 @@ class Main(Star):
         template = self.content_config.get("push_message_format", DEFAULT_PUSH_TEMPLATE)
         return str(template or DEFAULT_PUSH_TEMPLATE).replace("\\n", "\n")
 
+    @property
+    def acfun_passive_config(self) -> dict[str, Any]:
+        return self.config.get("acfun_passive_settings", {}) or {}
+
+    @property
+    def acfun_monitoring_config(self) -> dict[str, Any]:
+        return self.config.get("acfun_monitoring_settings", {}) or {}
+
+    @property
+    def acfun_content_config(self) -> dict[str, Any]:
+        return self.config.get("acfun_content_settings", {}) or {}
+
+    @property
+    def acfun_auto_parse_enabled(self) -> bool:
+        return bool(self.acfun_passive_config.get("acfun_auto_parse_enabled", True))
+
+    @property
+    def acfun_parse_template(self) -> str:
+        template = self.acfun_content_config.get(
+            "acfun_parse_message_format", ACFUN_DEFAULT_PARSE_TEMPLATE
+        )
+        return str(template or ACFUN_DEFAULT_PARSE_TEMPLATE).replace("\\n", "\n")
+
+    @property
+    def acfun_push_template(self) -> str:
+        template = self.acfun_content_config.get(
+            "acfun_push_message_format", ACFUN_DEFAULT_PUSH_TEMPLATE
+        )
+        return str(template or ACFUN_DEFAULT_PUSH_TEMPLATE).replace("\\n", "\n")
+
+    def _acfun_send_direct_video_enabled(self) -> bool:
+        return bool(self.acfun_content_config.get("acfun_send_direct_video", True))
+
+    def _acfun_send_rich_text_enabled(self) -> bool:
+        return bool(self.acfun_content_config.get("acfun_send_rich_text", False))
+
     def _send_direct_video_enabled(self) -> bool:
         return bool(self.content_config.get("send_direct_video", True))
 
@@ -889,8 +1409,10 @@ class Main(Star):
     async def initialize(self):
         self.running = True
         self.debouncer.update_ttl(self.debounce_seconds)
+        self.acfun_debouncer.update_ttl(self.debounce_seconds)
         await self._cleanup_media_cache(force=False)
         self.monitor_task = asyncio.create_task(self.run_monitor())
+        self.acfun_monitor_task = asyncio.create_task(self._acfun_run_monitor())
 
     async def terminate(self):
         self.running = False
@@ -898,6 +1420,12 @@ class Main(Star):
             self.monitor_task.cancel()
             try:
                 await self.monitor_task
+            except asyncio.CancelledError:
+                pass
+        if self.acfun_monitor_task:
+            self.acfun_monitor_task.cancel()
+            try:
+                await self.acfun_monitor_task
             except asyncio.CancelledError:
                 pass
         await self.client.aclose()
@@ -1658,6 +2186,417 @@ class Main(Star):
             except Exception as err:
                 logger.error(f"BilibiliPush: 轮询 UID {rule.uid} 失败: {err}")
 
+    def _is_acfun_passive_session_allowed(self, event: AstrMessageEvent) -> bool:
+        whitelist = self._parse_string_list(self.acfun_passive_config.get("acfun_session_whitelist", []))
+        blacklist = self._parse_string_list(self.acfun_passive_config.get("acfun_session_blacklist", []))
+        umo = event.unified_msg_origin
+        if whitelist and umo not in whitelist:
+            return False
+        if blacklist and umo in blacklist:
+            return False
+        return True
+
+    def _resolve_acfun_monitor_rules(self) -> list[AcFunMonitorRule]:
+        raw_rules = self.acfun_monitoring_config.get("acfun_subscription_rules", []) or []
+        merged_targets: dict[int, list[str]] = {}
+        source_map: dict[int, str] = {}
+
+        for item in raw_rules:
+            if not isinstance(item, dict):
+                continue
+            targets = self._parse_multi_value(item.get("allowed_targets", ""))
+            if not targets:
+                continue
+            for source in self._parse_multi_value(item.get("source", "")):
+                user_id = self.acfun_service.resolve_user_id(source)
+                if user_id is None:
+                    logger.warning(f"AcFunPush: 无法解析监控来源 {source!r}，已跳过")
+                    continue
+                merged_targets.setdefault(user_id, [])
+                for target in targets:
+                    if target not in merged_targets[user_id]:
+                        merged_targets[user_id].append(target)
+                source_map.setdefault(user_id, source)
+
+        return [
+            AcFunMonitorRule(
+                user_id=user_id,
+                targets=tuple(targets),
+                source=source_map.get(user_id, str(user_id)),
+            )
+            for user_id, targets in merged_targets.items()
+        ]
+
+    def _render_acfun_video_text(self, card: AcFunVideoCard, *, push: bool) -> str:
+        desc_limit = safe_int(
+            self.acfun_content_config.get("acfun_description_length", DEFAULT_DESC_LENGTH),
+            DEFAULT_DESC_LENGTH,
+            minimum=0,
+            maximum=2000,
+        )
+        desc = sanitize_desc(card.desc, desc_limit)
+        payload = SafeFormatDict(
+            title=card.title,
+            up_name=card.up_name,
+            link=card.link,
+            acid=card.acid,
+            duration=card.duration_text,
+            pub_time=format_timestamp(card.pub_ts),
+            view=format_count(card.view),
+            like=format_count(card.like),
+            danmaku=format_count(card.danmaku),
+            banana=format_count(card.banana),
+            stow=format_count(card.stow),
+            comment=format_count(card.comment),
+            share=format_count(card.share),
+            channel=card.channel,
+            desc=desc,
+        )
+        template = self.acfun_push_template if push else self.acfun_parse_template
+        return template.format_map(payload)
+
+    def _build_acfun_rich_text_chain(self, card: AcFunVideoCard) -> MessageChain:
+        chain = MessageChain()
+        chain.message(self._render_acfun_video_text(card, push=False))
+        if bool(self.acfun_content_config.get("acfun_send_cover", True)) and card.cover_url:
+            chain.url_image(card.cover_url)
+        return chain
+
+    def _build_acfun_video_chain(self, card: AcFunVideoCard) -> MessageChain | None:
+        if card.video_path is None or not self._acfun_send_direct_video_enabled():
+            return None
+        chain = MessageChain()
+        chain.chain.append(MessageVideo.fromFileSystem(str(card.video_path)))
+        return chain
+
+    def _build_acfun_message_chains(self, card: AcFunVideoCard, *, push: bool = False) -> list[MessageChain]:
+        chains: list[MessageChain] = []
+        video_chain = self._build_acfun_video_chain(card)
+        send_rich_text = self._acfun_send_rich_text_enabled() or video_chain is None
+
+        if send_rich_text:
+            rich_chain = MessageChain()
+            rich_chain.message(self._render_acfun_video_text(card, push=push))
+            if bool(self.acfun_content_config.get("acfun_send_cover", True)) and card.cover_url:
+                rich_chain.url_image(card.cover_url)
+            chains.append(rich_chain)
+        if video_chain is not None:
+            chains.append(video_chain)
+
+        if not chains:
+            rich_chain = MessageChain()
+            rich_chain.message(self._render_acfun_video_text(card, push=push))
+            chains.append(rich_chain)
+
+        return chains
+
+    async def _send_acfun_card_to_targets(
+        self, card: AcFunVideoCard, targets: Sequence[str]
+    ) -> dict[str, int]:
+        success = 0
+        failure = 0
+        for target in targets:
+            try:
+                chains = self._build_acfun_message_chains(card, push=True)
+                send_success = True
+                for chain in chains:
+                    sent = await self.context.send_message(target, chain)
+                    send_success = send_success and bool(sent)
+                if send_success:
+                    success += 1
+                else:
+                    failure += 1
+            except Exception as err:
+                logger.error(f"AcFunPush: 发送到 {target} 失败: {err}")
+                failure += 1
+        return {"target_success": success, "target_failure": failure}
+
+    async def _check_acfun_user_videos(
+        self, user_id: int, *, force_fetch: bool = False
+    ) -> list[AcFunVideoItem]:
+        fetch_limit = safe_int(
+            self.runtime_config.get("latest_fetch_limit", DEFAULT_FETCH_LIMIT),
+            DEFAULT_FETCH_LIMIT,
+            minimum=1,
+            maximum=20,
+        )
+        items = await self.acfun_service.fetch_recent_videos(user_id, fetch_limit)
+        if not items:
+            return []
+        if force_fetch:
+            return items
+
+        state_key_acid = f"acfun_last_acid_{user_id}"
+        last_acid = str(self._state_get(state_key_acid, "") or "")
+        latest = items[0]
+
+        if not last_acid or user_id not in self.acfun_session_initialized_uids:
+            self._state_update({state_key_acid: latest.acid})
+            self.acfun_session_initialized_uids.add(user_id)
+            logger.info(f"AcFunPush: 初始化 UID={user_id} 的监控基线为 {latest.acid}")
+            return []
+
+        new_items: list[AcFunVideoItem] = []
+        for item in items:
+            if item.acid == last_acid:
+                break
+            new_items.append(item)
+
+        self.acfun_session_initialized_uids.add(user_id)
+        self._state_update({state_key_acid: latest.acid})
+        new_items.reverse()
+        return new_items
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_acfun_message(self, event: AstrMessageEvent):
+        if not self.acfun_auto_parse_enabled:
+            return
+        if not self._is_acfun_passive_session_allowed(event):
+            return
+        if str(event.get_sender_id()) == str(event.get_self_id()):
+            return
+
+        messages = event.get_messages() or []
+        if messages:
+            first = messages[0]
+            if isinstance(first, At) and str(first.qq) != str(event.get_self_id()):
+                return
+
+        self.acfun_debouncer.update_ttl(self.debounce_seconds)
+
+        try:
+            target = await self.acfun_link_resolver.extract_parse_target(
+                messages, event.message_str or ""
+            )
+            if target is None:
+                return
+
+            debounce_key = target.raw_input or target.acid
+            if self.acfun_debouncer.hit_link(event.unified_msg_origin, debounce_key):
+                return
+
+            card = await self.acfun_service.fetch_video_card(target)
+            await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
+
+            acfun_target = AcFunParseTarget(
+                acid=card.acid,
+                raw_input=target.raw_input,
+                source_kind=target.source_kind,
+            )
+            should_emoji = (
+                bool(self.acfun_passive_config.get("acfun_qq_link_emoji_enabled", True))
+                and event.get_platform_id() == "aiocqhttp"
+                and acfun_target.source_kind in {"link", "card"}
+            )
+            if should_emoji:
+                await self._attach_qq_emoji_reaction(event, ParseTarget(bvid=card.acid, source_kind=target.source_kind))
+
+            if self.acfun_debouncer.hit_resource(event.unified_msg_origin, card.acid):
+                return
+
+            chains = self._build_acfun_message_chains(card, push=False)
+            for chain in chains:
+                yield event.chain_result(chain.chain)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            logger.error(f"AcFunPush: 自动解析失败: {err}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("acfun_parse_on", alias={"开启A站解析", "开启acfun解析"})
+    async def acfun_parse_on(self, event: AstrMessageEvent):
+        passive_settings = self.config.setdefault("acfun_passive_settings", {})
+        blacklist = passive_settings.setdefault("acfun_session_blacklist", [])
+        if not isinstance(blacklist, list):
+            blacklist = []
+            passive_settings["acfun_session_blacklist"] = blacklist
+        whitelist = passive_settings.setdefault("acfun_session_whitelist", [])
+        if not isinstance(whitelist, list):
+            whitelist = []
+            passive_settings["acfun_session_whitelist"] = whitelist
+        umo = event.unified_msg_origin
+        if umo in blacklist:
+            blacklist.remove(umo)
+        if whitelist and umo not in whitelist:
+            whitelist.append(umo)
+        self._persist_passive_session_filters()
+        yield event.plain_result("✅ 已开启当前会话的 AcFun 被动解析。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("acfun_parse_off", alias={"关闭A站解析", "关闭acfun解析"})
+    async def acfun_parse_off(self, event: AstrMessageEvent):
+        passive_settings = self.config.setdefault("acfun_passive_settings", {})
+        blacklist = passive_settings.setdefault("acfun_session_blacklist", [])
+        if not isinstance(blacklist, list):
+            blacklist = []
+            passive_settings["acfun_session_blacklist"] = blacklist
+        umo = event.unified_msg_origin
+        if umo not in blacklist:
+            blacklist.append(umo)
+        self._persist_passive_session_filters()
+        yield event.plain_result("✅ 已关闭当前会话的 AcFun 被动解析。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("acfun_check", alias={"accheck"})
+    async def acfun_check(self, event: AstrMessageEvent, source: str = ""):
+        if source:
+            try:
+                user_id = self.acfun_service.resolve_user_id(source)
+                if user_id is None:
+                    yield event.plain_result("❌ 无法从输入中解析出用户 ID，请提供 UID 或 AcFun 主页链接。")
+                    return
+                recent = await self._check_acfun_user_videos(user_id, force_fetch=True)
+                if not recent:
+                    yield event.plain_result(f"ℹ️ UID {user_id} 最近没有获取到视频。")
+                    return
+                card = await self.acfun_service.fetch_video_card(
+                    AcFunParseTarget(acid=recent[0].acid)
+                )
+                await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
+                for chain in self._build_acfun_message_chains(card, push=True):
+                    await self.context.send_message(event.unified_msg_origin, chain)
+                yield event.plain_result(f"✅ 已向当前会话发送 UID {user_id} 的最新视频。")
+            except Exception as err:
+                logger.error(f"AcFunPush: 手动检查失败: {err}")
+                yield event.plain_result(f"❌ 手动检查失败: {err}")
+            return
+
+        rules = self._resolve_acfun_monitor_rules()
+        if not rules:
+            yield event.plain_result("❌ 没有可用的 AcFun 监控规则，请先在插件配置中填写订阅规则。")
+            return
+
+        rule = rules[0]
+        recent = await self._check_acfun_user_videos(rule.user_id, force_fetch=True)
+        if not recent:
+            yield event.plain_result(f"ℹ️ UID {rule.user_id} 最近没有获取到视频。")
+            return
+
+        card = await self.acfun_service.fetch_video_card(
+            AcFunParseTarget(acid=recent[0].acid)
+        )
+        await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
+        result = await self._send_acfun_card_to_targets(card, list(rule.targets))
+        yield event.plain_result(
+            f"✅ 推送完成：成功目标 {result['target_success']}，失败目标 {result['target_failure']}。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("acfun_check_all", alias={"accheck_all"})
+    async def acfun_check_all(self, event: AstrMessageEvent):
+        rules = self._resolve_acfun_monitor_rules()
+        if not rules:
+            yield event.plain_result("❌ 没有可用的 AcFun 监控规则，请先在插件配置中填写订阅规则。")
+            return
+
+        yield event.plain_result(f"🔍 正在立即检查 {len(rules)} 条 AcFun 监控规则...")
+        summaries: list[str] = []
+        request_interval = safe_int(
+            self.runtime_config.get("request_interval", DEFAULT_REQUEST_INTERVAL_SECONDS),
+            DEFAULT_REQUEST_INTERVAL_SECONDS,
+            minimum=1,
+            maximum=60,
+        )
+        request_jitter = safe_int(
+            self.runtime_config.get("request_interval_jitter", 0),
+            0,
+            minimum=0,
+            maximum=30,
+        )
+
+        for index, rule in enumerate(rules):
+            if index > 0:
+                await asyncio.sleep(self._pick_interval(request_interval, request_jitter, minimum=1))
+            try:
+                recent = await self._check_acfun_user_videos(rule.user_id, force_fetch=True)
+                if not recent:
+                    summaries.append(f"ℹ️ UID {rule.user_id} 没有获取到视频")
+                    continue
+                card = await self.acfun_service.fetch_video_card(
+                    AcFunParseTarget(acid=recent[0].acid)
+                )
+                await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
+                result = await self._send_acfun_card_to_targets(card, list(rule.targets))
+                if result["target_failure"] > 0:
+                    summaries.append(
+                        f"⚠️ UID {rule.user_id} 部分成功："
+                        f"成功 {result['target_success']}，失败 {result['target_failure']}"
+                    )
+                else:
+                    summaries.append(f"✅ UID {rule.user_id} 推送成功")
+            except Exception as err:
+                logger.error(f"AcFunPush: 检查 UID {rule.user_id} 失败: {err}")
+                summaries.append(f"❌ UID {rule.user_id} 检查失败: {err}")
+
+        yield event.plain_result("\n".join(summaries))
+
+    async def _acfun_run_monitor(self):
+        logger.info("AcFunPush: 监控任务已启动")
+        await asyncio.sleep(STARTUP_DELAY_SECONDS)
+
+        while self.running:
+            try:
+                rules = self._resolve_acfun_monitor_rules()
+                interval = safe_int(
+                    self.runtime_config.get("check_interval", DEFAULT_CHECK_INTERVAL_MINUTES),
+                    DEFAULT_CHECK_INTERVAL_MINUTES,
+                    minimum=1,
+                    maximum=24 * 60,
+                )
+                jitter = safe_int(
+                    self.runtime_config.get("check_interval_jitter", 0),
+                    0,
+                    minimum=0,
+                    maximum=180,
+                )
+                sleep_minutes = self._pick_interval(interval, jitter, minimum=1)
+
+                if not rules:
+                    logger.debug("AcFunPush: 当前无可用监控规则")
+                else:
+                    await self._cleanup_media_cache(force=False)
+                    await self._acfun_run_monitor_cycle(rules)
+
+                logger.debug(f"AcFunPush: 下次检查将在 {sleep_minutes} 分钟后执行")
+                await asyncio.sleep(sleep_minutes * 60)
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                logger.error(f"AcFunPush: 监控循环异常: {err}")
+                await asyncio.sleep(60)
+
+    async def _acfun_run_monitor_cycle(self, rules: Sequence[AcFunMonitorRule]) -> None:
+        request_interval = safe_int(
+            self.runtime_config.get("request_interval", DEFAULT_REQUEST_INTERVAL_SECONDS),
+            DEFAULT_REQUEST_INTERVAL_SECONDS,
+            minimum=1,
+            maximum=60,
+        )
+        request_jitter = safe_int(
+            self.runtime_config.get("request_interval_jitter", 0),
+            0,
+            minimum=0,
+            maximum=30,
+        )
+
+        for index, rule in enumerate(rules):
+            if index > 0:
+                await asyncio.sleep(self._pick_interval(request_interval, request_jitter, minimum=1))
+            try:
+                new_items = await self._check_acfun_user_videos(rule.user_id)
+                if not new_items:
+                    continue
+                for item in new_items:
+                    card = await self.acfun_service.fetch_video_card(
+                        AcFunParseTarget(acid=item.acid)
+                    )
+                    await self._cleanup_media_cache(force=False, keep_paths=[card.video_path])
+                    await self._send_acfun_card_to_targets(card, list(rule.targets))
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                logger.error(f"AcFunPush: 轮询 UID {rule.user_id} 失败: {err}")
+
 
 def safe_int(value: Any, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
     try:
@@ -1736,6 +2675,38 @@ def extract_json_url(data: Any) -> str | None:
         match = BV_PATTERN.search(value)
         if match:
             return match.group("bvid")
+    return None
+
+
+def extract_acfun_json_url(data: Any) -> str | None:
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception as err:
+            logger.debug(f"AcFunPush: 解析分享卡片 JSON 失败: {err}")
+            return None
+    if not isinstance(data, dict):
+        return None
+
+    meta = data.get("meta")
+    if isinstance(meta, dict):
+        for key1, key2 in (
+            ("detail_1", "qqdocurl"),
+            ("news", "jumpUrl"),
+        ):
+            section = meta.get(key1)
+            if isinstance(section, dict):
+                url = section.get(key2)
+                if isinstance(url, str) and url:
+                    return strip_trailing_punctuation(url)
+
+    for value in iter_string_values(data):
+        match = ACFUN_URL_PATTERN.search(value)
+        if match:
+            return strip_trailing_punctuation(match.group(0))
+        match = ACID_PATTERN.search(value)
+        if match:
+            return match.group(0)
     return None
 
 
@@ -1852,3 +2823,38 @@ async def merge_av(
 
     await safe_unlink(v_path)
     await safe_unlink(a_path)
+
+
+def _extract_json_object(text: str, start: int) -> str | None:
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escape_next = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if escape_next:
+            escape_next = False
+            i += 1
+            continue
+        if ch == "\\":
+            if in_string:
+                escape_next = True
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+            i += 1
+            continue
+        if in_string:
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+        i += 1
+    return None
