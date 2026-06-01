@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import random
 import re
@@ -36,6 +37,7 @@ DEFAULT_REQUEST_INTERVAL_SECONDS = 2
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_VIDEO_DOWNLOAD_TIMEOUT_SECONDS = 300
 DEFAULT_DEBOUNCE_SECONDS = 300
+DEFAULT_VIDEO_SEND_FAILURE_COOLDOWN_SECONDS = 600
 DEFAULT_FETCH_LIMIT = 5
 DEFAULT_DESC_LENGTH = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 90
@@ -92,6 +94,12 @@ SPACE_UID_PATTERN = re.compile(
 SPACE_UID_QUERY_PATTERN = re.compile(r"(?:uid|mid|vmid)=(?P<uid>\d+)", re.IGNORECASE)
 BILIBILI_SCHEME_AV_PATTERN = re.compile(r"bilibili://video/av(?P<avid>\d+)", re.IGNORECASE)
 TRAILING_PUNCTUATION = "'\"）)]】}>，。！？；：,.!?;:"
+TRUSTED_COVER_HOST_SUFFIXES = (
+    "hdslb.com",
+    "bilibili.com",
+    "acfun.cn",
+    "aixifan.com",
+)
 
 ACFUN_DEFAULT_PARSE_TEMPLATE = (
     "📺 {title}\n"
@@ -504,34 +512,86 @@ class BilibiliService:
     async def fetch_recent_videos(self, uid: int, limit: int) -> list[FeedVideoItem]:
         credential = await self.credential_manager.get_credential()
         user = User(uid, credential=credential)
-        payload = await user.get_videos(ps=max(1, min(limit, 30)), order=VideoOrder.PUBDATE)
+        page_size = max(1, min(limit, 30))
+        primary_error: Exception | None = None
+        try:
+            payload = await user.get_videos(ps=page_size, order=VideoOrder.PUBDATE)
+        except Exception as err:
+            primary_error = err
+            logger.warning(
+                f"BilibiliPush: 获取 UID={uid} 投稿列表失败，尝试使用 medialist 接口: {type(err).__name__}"
+            )
+        else:
+            return self._parse_user_video_items(payload)
+
+        try:
+            payload = await user.get_media_list(ps=page_size, desc=True)
+        except Exception as fallback_err:
+            raise RuntimeError(
+                f"获取 UID={uid} 投稿列表失败，medialist 回退也失败: {type(fallback_err).__name__}"
+            ) from None
+        return self._parse_media_list_items(payload)
+
+    def _parse_user_video_items(self, payload: Any) -> list[FeedVideoItem]:
         section = payload.get("list") if isinstance(payload, dict) else None
         raw_items = []
         if isinstance(section, dict):
             raw_items = section.get("vlist") or []
         elif isinstance(payload, dict):
             raw_items = payload.get("vlist") or []
+        return self._build_feed_items(raw_items, source="user_video")
 
+    def _parse_media_list_items(self, payload: Any) -> list[FeedVideoItem]:
+        raw_items = []
+        if isinstance(payload, dict):
+            raw_items = payload.get("media_list") or []
+            section = payload.get("list")
+            if not raw_items and isinstance(section, dict):
+                raw_items = section.get("media_list") or []
+        return self._build_feed_items(raw_items, source="media_list")
+
+    def _build_feed_items(self, raw_items: Any, *, source: str) -> list[FeedVideoItem]:
         items: list[FeedVideoItem] = []
+        if not isinstance(raw_items, list):
+            return items
+
         for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
-            bvid = str(raw.get("bvid") or "")
-            aid = safe_int(raw.get("aid"), 0)
-            if not bvid or aid <= 0:
+            if source == "media_list":
+                bvid = str(raw.get("bv_id") or raw.get("bvid") or "")
+                aid = safe_int(raw.get("id") or raw.get("aid"), 0)
+                created_ts = safe_int(raw.get("pubtime") or raw.get("created"), 0)
+                cover_url = normalize_cover_url(raw.get("cover") or raw.get("pic") or "")
+                desc = str(raw.get("intro") or raw.get("description") or "")
+            else:
+                bvid = str(raw.get("bvid") or raw.get("bv_id") or "")
+                aid = safe_int(raw.get("aid") or raw.get("id"), 0)
+                created_ts = safe_int(raw.get("created") or raw.get("pubtime"), 0)
+                cover_url = normalize_cover_url(raw.get("pic") or raw.get("cover") or "")
+                desc = str(raw.get("description") or raw.get("intro") or "")
+            if not BV_PATTERN.fullmatch(bvid) or aid <= 0:
                 continue
             items.append(
                 FeedVideoItem(
                     aid=aid,
                     bvid=bvid,
                     title=str(raw.get("title") or "未命名视频"),
-                    created_ts=safe_int(raw.get("created"), 0),
-                    author=str(raw.get("author") or "未知UP"),
-                    cover_url=normalize_cover_url(raw.get("pic") or ""),
-                    desc=str(raw.get("description") or ""),
+                    created_ts=created_ts,
+                    author=self._extract_feed_author(raw),
+                    cover_url=cover_url,
+                    desc=desc,
                 )
             )
         return items
+
+    def _extract_feed_author(self, raw: dict[str, Any]) -> str:
+        author = raw.get("author") or raw.get("up_name")
+        if not author:
+            upper = raw.get("upper") or raw.get("owner")
+            if isinstance(upper, dict):
+                author = upper.get("name") or upper.get("uname")
+        return str(author or "未知UP")
 
     async def fetch_video_card(self, target: ParseTarget) -> VideoCard:
         credential = await self.credential_manager.get_credential()
@@ -637,15 +697,20 @@ class BilibiliService:
             raise MediaDownloadError("未找到可下载的视频流")
 
         video_stream = streams[0]
-        if not isinstance(video_stream, VideoStreamDownloadURL):
+        video_url = self._stream_url(video_stream)
+        if not video_url:
             raise MediaDownloadError("视频流解析失败")
 
         audio_stream = streams[1] if len(streams) > 1 else None
-        audio_url = audio_stream.url if isinstance(audio_stream, AudioStreamDownloadURL) else None
+        audio_url = self._stream_url(audio_stream) if isinstance(audio_stream, AudioStreamDownloadURL) else None
 
         safe_quality = re.sub(r"[^A-Za-z0-9_]+", "_", quality_name)
         safe_codec = re.sub(r"[^A-Za-z0-9_]+", "_", codec_name)
-        stem = f"{bvid}-p{page_index + 1}-{safe_quality}-{safe_codec}"
+        if isinstance(video_stream, VideoStreamDownloadURL):
+            stream_label = f"{safe_quality}-{safe_codec}"
+        else:
+            stream_label = "direct"
+        stem = f"{bvid}-p{page_index + 1}-{stream_label}"
         output_path = self.cache_dir / f"{stem}.mp4"
         if output_path.exists() and output_path.stat().st_size > 0:
             if output_path.stat().st_size > max_bytes:
@@ -655,11 +720,11 @@ class BilibiliService:
 
         headers = await self._build_media_headers()
         if audio_url:
-            video_temp = self.cache_dir / f"{stem}.video{suffix_from_url(video_stream.url, '.m4s')}"
+            video_temp = self.cache_dir / f"{stem}.video{suffix_from_url(video_url, '.m4s')}"
             audio_temp = self.cache_dir / f"{stem}.audio{suffix_from_url(audio_url, '.m4s')}"
             try:
                 await asyncio.gather(
-                    self._download_stream(video_stream.url, video_temp, headers, timeout_seconds, max_bytes),
+                    self._download_stream(video_url, video_temp, headers, timeout_seconds, max_bytes),
                     self._download_stream(audio_url, audio_temp, headers, timeout_seconds, max_bytes),
                 )
                 if video_temp.stat().st_size + audio_temp.stat().st_size > max_bytes:
@@ -679,7 +744,7 @@ class BilibiliService:
                 raise
         else:
             await self._download_stream(
-                video_stream.url,
+                video_url,
                 output_path,
                 headers,
                 timeout_seconds,
@@ -691,6 +756,10 @@ class BilibiliService:
             raise MediaSizeLimitError(f"视频文件超过 {max_size_mb} MB 限制")
 
         return output_path
+
+    def _stream_url(self, stream: Any) -> str:
+        url = getattr(stream, "url", "")
+        return str(url or "")
 
     async def _build_media_headers(self) -> dict[str, str]:
         headers = dict(self.default_headers)
@@ -1304,6 +1373,7 @@ class Main(Star):
         )
         self.link_resolver = LinkResolver(self.service)
         self.debouncer = DebounceCache(self.debounce_seconds)
+        self._video_send_failure_until: dict[str, float] = {}
 
         self.acfun_service = AcFunService(
             client=self.client,
@@ -1347,6 +1417,18 @@ class Main(Star):
         return safe_int(
             self.runtime_config.get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS),
             DEFAULT_DEBOUNCE_SECONDS,
+            minimum=0,
+            maximum=24 * 60 * 60,
+        )
+
+    @property
+    def video_send_failure_cooldown_seconds(self) -> int:
+        return safe_int(
+            self.runtime_config.get(
+                "video_send_failure_cooldown_seconds",
+                DEFAULT_VIDEO_SEND_FAILURE_COOLDOWN_SECONDS,
+            ),
+            DEFAULT_VIDEO_SEND_FAILURE_COOLDOWN_SECONDS,
             minimum=0,
             maximum=24 * 60 * 60,
         )
@@ -1874,7 +1956,11 @@ class Main(Star):
                 chains = self._build_message_chains(card, push=True)
                 send_success = True
                 for chain in chains:
-                    sent = await self.context.send_message(target, chain)
+                    if self._is_video_only_chain(chain):
+                        await self._send_chain_with_video_fallback(target, chain, card, push=True)
+                        sent = True
+                    else:
+                        sent = await self.context.send_message(target, chain)
                     send_success = send_success and bool(sent)
                 if send_success:
                     success += 1
@@ -1884,6 +1970,60 @@ class Main(Star):
                 logger.error(f"BilibiliPush: 发送到 {target} 失败: {err}")
                 failure += 1
         return {"target_success": success, "target_failure": failure}
+
+    async def _send_chain_with_video_fallback(
+        self,
+        destination: str,
+        chain: MessageChain,
+        card: VideoCard,
+        *,
+        push: bool,
+    ) -> None:
+        if self._is_video_send_cooldown_active(destination):
+            logger.info(
+                f"BilibiliPush: 目标 {destination} 仍在视频发送失败冷却期内，直接发送图文卡片"
+            )
+            fallback_chain = self._build_rich_text_chain(card, push=push)
+            await self.context.send_message(destination, fallback_chain)
+            return
+
+        try:
+            await self.context.send_message(destination, chain)
+        except Exception as err:
+            if not self._is_video_only_chain(chain):
+                raise
+            self._mark_video_send_failed(destination)
+            logger.warning(
+                f"BilibiliPush: 视频发送到 {destination} 失败，回退为图文卡片: {err}"
+            )
+            fallback_chain = self._build_rich_text_chain(card, push=push)
+            await self.context.send_message(destination, fallback_chain)
+
+    def _is_video_send_cooldown_active(self, destination: str) -> bool:
+        failure_until = getattr(self, "_video_send_failure_until", {})
+        now = time.time()
+        expires_at = float(failure_until.get(destination, 0) or 0)
+        if expires_at > now:
+            return True
+        failure_until.pop(destination, None)
+        return False
+
+    def _mark_video_send_failed(self, destination: str) -> None:
+        cooldown_seconds = self.video_send_failure_cooldown_seconds
+        if cooldown_seconds <= 0:
+            return
+        if not hasattr(self, "_video_send_failure_until"):
+            self._video_send_failure_until = {}
+        self._video_send_failure_until[destination] = time.time() + cooldown_seconds
+
+    def _is_video_only_chain(self, chain: MessageChain) -> bool:
+        if len(chain.chain) != 1:
+            return False
+        component = chain.chain[0]
+        if isinstance(component, MessageVideo):
+            return True
+        component_type = getattr(component, "type", "")
+        return str(component_type).lower().endswith("video")
 
     async def _check_uid_videos(self, uid: int, *, force_fetch: bool = False) -> list[FeedVideoItem]:
         fetch_limit = safe_int(
@@ -1904,7 +2044,7 @@ class Main(Star):
         last_bvid = str(self._state_get(state_key_bvid, "") or "")
         latest = items[0]
 
-        if last_aid == 0 or uid not in self.session_initialized_uids:
+        if last_aid == 0 and not last_bvid:
             self._state_update({state_key_aid: latest.aid, state_key_bvid: latest.bvid})
             self.session_initialized_uids.add(uid)
             logger.info(f"BilibiliPush: 初始化 UID={uid} 的监控基线为 {latest.bvid}")
@@ -1955,6 +2095,14 @@ class Main(Star):
 
             chains = self._build_message_chains(card, push=False, event=event, target=target)
             for chain in chains:
+                if self._is_video_only_chain(chain):
+                    await self._send_chain_with_video_fallback(
+                        event.unified_msg_origin,
+                        chain,
+                        card,
+                        push=False,
+                    )
+                    continue
                 yield event.chain_result(chain.chain)
         except asyncio.CancelledError:
             raise
@@ -2710,14 +2858,48 @@ def extract_acfun_json_url(data: Any) -> str | None:
     return None
 
 
-def normalize_cover_url(url: str) -> str:
-    if not url:
+def normalize_cover_url(url: Any) -> str:
+    if not isinstance(url, str):
         return ""
-    if url.startswith("//"):
-        return f"https:{url}"
-    if url.startswith("http://") or url.startswith("https://"):
-        return url
-    return f"https://{url.lstrip('/')}"
+    cleaned = url.strip()
+    if not cleaned or len(cleaned) > 2048:
+        return ""
+    if cleaned.startswith("//"):
+        cleaned = f"https:{cleaned}"
+    elif not cleaned.startswith("http://") and not cleaned.startswith("https://"):
+        cleaned = f"https://{cleaned.lstrip('/')}"
+
+    parsed = urlparse(cleaned)
+    if not _is_trusted_cover_url(parsed):
+        return ""
+    return parsed.geturl()
+
+
+def _is_trusted_cover_url(parsed) -> bool:
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if parsed.username or parsed.password or parsed.port is not None:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return not (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    return any(
+        host == suffix or host.endswith(f".{suffix}")
+        for suffix in TRUSTED_COVER_HOST_SUFFIXES
+    )
 
 
 def sanitize_desc(desc: str, limit: int) -> str:
